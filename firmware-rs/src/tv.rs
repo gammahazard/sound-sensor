@@ -1,42 +1,24 @@
 //! tv.rs — Modular TV volume control
 //!
-//! Supported brands (runtime-selectable via PWA "TV" tab):
-//!   LG WebOS   — ssap:// WebSocket on port 3000           [IMPLEMENTED]
-//!   Samsung    — Smart Remote WS on port 8001              [IMPLEMENTED]
-//!   Sony       — Bravia REST JSON-RPC on port 80           [IMPLEMENTED]
-//!   Roku       — ECP HTTP on port 8060                     [IMPLEMENTED]
-//!
-//! Brand protocol summary (from research):
-//!   LG:      ssap:// WebSocket, pairing popup, absolute volume via getVolume/setVolume
-//!   Samsung: WebSocket key-press only (port 8001 plain, 8002 TLS not supported yet).
-//!            No absolute volume via WS. Pairing token stored in TvConfig for the session.
-//!            Relative restore only (N × KEY_VOLUP). Token persists in-memory; Phase 3 adds flash.
-//!   Sony:    HTTP JSON-RPC at /sony/audio port 80. PSK auth via X-Auth-PSK header.
-//!            User sets a PIN in TV Settings → Network → IP Control → Pre-Shared Key.
-//!            Absolute volume: getVolumeInformation + setAudioVolume v1.2 (volume is a string).
-//!   Roku:    ECP HTTP on port 8060. No auth. No absolute volume. POST /keypress/VolumeDown.
-//!            Only works on Roku TVs (not Roku sticks). Relative restore only.
-//!
-//! Restore behaviour:
-//!   LG/Sony  — absolute: ramp setVolume from ducked level back to original, RESTORE_STEP_MS apart
-//!   Samsung/Roku — relative: N × VolumeUp (duck_steps_taken), RESTORE_STEP_MS apart
+//! Supported brands:
+//!   LG WebOS   — ssap:// WebSocket on port 3000
+//!   Samsung    — Smart Remote WS on port 8001
+//!   Sony       — Bravia REST JSON-RPC on port 80
+//!   Roku       — ECP HTTP on port 8060
 
 use defmt::*;
-use embassy_net::{Stack, TcpSocket};
+use embassy_net::{Stack, TcpSocket, UdpSocket, IpAddress, IpEndpoint};
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel, mutex::Mutex};
 use embassy_time::{Duration, Timer, with_timeout};
 use cyw43_pio::NetDriver;
 
 use crate::ducking::{DuckCommand, DuckingEngine};
+use crate::{WifiCmd, WIFI_CMD_CH};
 
-// ── Restore ramp rate ─────────────────────────────────────────────────────────
-/// Milliseconds between each volume step when ramping back up.
 const RESTORE_STEP_MS: u64 = 400;
-
-/// BASE64("GuardianSensor") — identifies our app to the Samsung TV on pairing.
 const SAMSUNG_APP_B64: &str = "R3VhcmRpYW5TZW5zb3I=";
 
-// ── TV brand + config ─────────────────────────────────────────────────────────
+// ── TV brand + config ───────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, defmt::Format)]
 pub enum TvBrand {
@@ -47,7 +29,6 @@ pub enum TvBrand {
 }
 
 impl TvBrand {
-    /// LG and Sony expose absolute-volume APIs; Samsung and Roku use key-press steps only.
     pub fn supports_absolute_volume(self) -> bool {
         matches!(self, TvBrand::Lg | TvBrand::Sony)
     }
@@ -70,26 +51,38 @@ impl TvBrand {
             _                      => None,
         }
     }
+
+    pub fn to_u8(self) -> u8 {
+        match self {
+            TvBrand::Lg      => 0,
+            TvBrand::Samsung => 1,
+            TvBrand::Sony    => 2,
+            TvBrand::Roku    => 3,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => TvBrand::Samsung,
+            2 => TvBrand::Sony,
+            3 => TvBrand::Roku,
+            _ => TvBrand::Lg,
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct TvConfig {
-    /// Dotted-decimal IP, e.g. "192.168.1.100". Empty = not yet configured.
     pub ip:            heapless::String<16>,
     pub brand:         TvBrand,
-    /// Sony Bravia Pre-Shared Key — user sets this in TV Settings → IP Control.
-    /// Sent as X-Auth-PSK header on every request. Typically 4 digits ("1234").
     pub sony_psk:      heapless::String<8>,
-    /// Samsung pairing token — received on first WS connect, stored for the session.
-    /// Eliminates the "allow connection?" popup on reconnects within the same session.
-    /// Phase 3: persist this to flash so it survives reboots.
     pub samsung_token: heapless::String<16>,
 }
 
 impl TvConfig {
     pub fn default() -> Self {
         let mut ip = heapless::String::new();
-        let _ = ip.push_str(env!("GUARDIAN_TV_IP", ""));
+        let _ = ip.push_str(option_env!("GUARDIAN_TV_IP").unwrap_or(""));
         Self {
             ip,
             brand:         TvBrand::Lg,
@@ -101,14 +94,111 @@ impl TvConfig {
     pub fn is_configured(&self) -> bool { !self.ip.is_empty() }
 }
 
-// ── Duck command channel (ws_task → tv_task) ──────────────────────────────────
+// ── Duck command channel (ws_task → tv_task) ────────────────────────────────
 static DUCK_CHANNEL: Channel<ThreadModeRawMutex, DuckCommand, 4> = Channel::new();
 
 pub async fn send_duck_command(cmd: DuckCommand) {
     let _ = DUCK_CHANNEL.try_send(cmd);
 }
 
-// ── TV task ───────────────────────────────────────────────────────────────────
+// ── SSDP discovery ──────────────────────────────────────────────────────────
+
+/// Discovered TV from SSDP scan
+#[derive(Clone, defmt::Format)]
+pub struct DiscoveredTv {
+    pub ip:    heapless::String<16>,
+    pub name:  heapless::String<48>,
+    pub brand: heapless::String<16>,
+}
+
+/// Send SSDP M-SEARCH and collect TV responses (~3 seconds).
+pub async fn discover_tvs(stack: &'static Stack<NetDriver<'static>>) -> heapless::Vec<DiscoveredTv, 8> {
+    let mut results: heapless::Vec<DiscoveredTv, 8> = heapless::Vec::new();
+
+    let mut rx_buf = [0u8; 512];
+    let mut tx_buf = [0u8; 256];
+    let mut rx_meta = [embassy_net::udp::PacketMetadata::EMPTY; 4];
+    let mut tx_meta = [embassy_net::udp::PacketMetadata::EMPTY; 4];
+
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+    if socket.bind(0).is_err() {
+        warn!("[tv] SSDP: failed to bind UDP");
+        return results;
+    }
+
+    let msearch = b"M-SEARCH * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n";
+
+    let dest = IpEndpoint::new(IpAddress::v4(239, 255, 255, 250), 1900);
+    let _ = socket.send_to(msearch, dest).await;
+
+    // Collect responses for 3 seconds
+    let deadline = embassy_time::Instant::now() + Duration::from_secs(3);
+    let mut resp_buf = [0u8; 512];
+
+    loop {
+        let remaining = deadline.saturating_duration_since(embassy_time::Instant::now());
+        if remaining.as_millis() == 0 { break; }
+
+        match with_timeout(remaining, socket.recv_from(&mut resp_buf)).await {
+            Ok(Ok((n, from))) => {
+                let resp = core::str::from_utf8(&resp_buf[..n]).unwrap_or("");
+
+                // Determine brand from SSDP response
+                let brand = if resp.contains("webos") || resp.contains("LG") {
+                    "lg"
+                } else if resp.contains("samsung") || resp.contains("Samsung") {
+                    "samsung"
+                } else if resp.contains("sony") || resp.contains("Sony") || resp.contains("BRAVIA") {
+                    "sony"
+                } else if resp.contains("roku") || resp.contains("Roku") {
+                    "roku"
+                } else {
+                    continue; // Not a TV we support
+                };
+
+                let ip_str = {
+                    let addr = from.addr;
+                    let mut s: heapless::String<16> = heapless::String::new();
+                    let _ = core::write!(s, "{}", addr);
+                    s
+                };
+
+                // Deduplicate by IP
+                if results.iter().any(|r| r.ip == ip_str) { continue; }
+
+                // Extract friendly name from LOCATION or SERVER header
+                let name = extract_ssdp_field(resp, "SERVER:")
+                    .or_else(|| extract_ssdp_field(resp, "server:"))
+                    .unwrap_or(brand);
+
+                let mut tv = DiscoveredTv {
+                    ip: ip_str,
+                    name: heapless::String::new(),
+                    brand: heapless::String::new(),
+                };
+                let _ = tv.name.push_str(&name[..name.len().min(47)]);
+                let _ = tv.brand.push_str(brand);
+                let _ = results.push(tv);
+            }
+            _ => break,
+        }
+    }
+
+    info!("[tv] SSDP discovered {} TVs", results.len());
+    results
+}
+
+fn extract_ssdp_field<'a>(resp: &'a str, key: &str) -> Option<&'a str> {
+    // Case-insensitive line match without alloc (no to_ascii_lowercase)
+    let line = resp.lines().find(|l| {
+        if l.len() < key.len() { return false; }
+        l.as_bytes()[..key.len()].iter().zip(key.as_bytes()).all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+    })?;
+    let pos = line.find(':')?;
+    Some(line[pos + 1..].trim())
+}
+
+// ── TV task ─────────────────────────────────────────────────────────────────
 #[embassy_executor::task]
 pub async fn tv_task(
     stack:     &'static Stack<NetDriver<'static>>,
@@ -124,7 +214,6 @@ pub async fn tv_task(
     let mut active_ip: heapless::String<16> = heapless::String::new();
 
     loop {
-        // ── Read current config ───────────────────────────────────────────────
         let config = {
             let c = tv_config.lock().await;
             c.clone()
@@ -142,7 +231,7 @@ pub async fn tv_task(
 
         let tv_port = config.brand.default_port();
         let tv_addr = match parse_ip(config.ip.as_str()) {
-            Some(a) => embassy_net::IpEndpoint::new(a, tv_port),
+            Some(a) => IpEndpoint::new(a, tv_port),
             None => {
                 warn!("[tv] Invalid IP: {}", config.ip.as_str());
                 Timer::after(Duration::from_secs(30)).await;
@@ -161,7 +250,7 @@ pub async fn tv_task(
             continue;
         }
 
-        // ── Brand-specific handshake / pairing ────────────────────────────────
+        // ── Brand-specific handshake ────────────────────────────────────────
         let connected = match config.brand {
             TvBrand::Lg => lg_connect(&mut socket, config.ip.as_str(), tv_port, &mut out_frame).await,
 
@@ -172,25 +261,37 @@ pub async fn tv_task(
                 };
                 match samsung_connect(&mut socket, config.ip.as_str(), tv_port, &token, &mut out_frame).await {
                     Some(new_token) => {
-                        // Store or update the token for this session
                         if !new_token.is_empty() {
-                            let mut c = tv_config.lock().await;
-                            c.samsung_token = new_token;
+                            let cfg_to_save = {
+                                let mut c = tv_config.lock().await;
+                                c.samsung_token = new_token;
+                                c.clone()
+                            };
+                            // Persist token to flash — log length only, not the token
+                            info!("[tv/samsung] Token received (len={}), saving to flash", cfg_to_save.samsung_token.len());
+                            if WIFI_CMD_CH.try_send(WifiCmd::SaveTvConfig(cfg_to_save)).is_err() {
+                                warn!("[tv] Failed to send SaveTvConfig to wifi_task");
+                            }
                         }
                         true
                     }
-                    None => false,
+                    None => {
+                        // Token may be expired — clear it and retry
+                        let mut c = tv_config.lock().await;
+                        if !c.samsung_token.is_empty() {
+                            info!("[tv/samsung] Clearing expired token");
+                            c.samsung_token.clear();
+                            let cfg_to_save = c.clone();
+                            drop(c);
+                            let _ = WIFI_CMD_CH.try_send(WifiCmd::SaveTvConfig(cfg_to_save));
+                        }
+                        false
+                    }
                 }
             }
 
-            TvBrand::Sony => {
-                // Sony uses stateless HTTP — no persistent connection handshake needed.
-                // We just verify the TCP connection is alive by sending a getVolumeInformation.
-                // (sony_connect is a no-op; the actual ping is done in the command loop.)
-                true
-            }
-
-            TvBrand::Roku => true, // ECP needs no handshake
+            TvBrand::Sony => true,
+            TvBrand::Roku => true,
         };
 
         if !connected {
@@ -203,9 +304,8 @@ pub async fn tv_task(
         let _ = active_ip.push_str(config.ip.as_str());
         info!("[tv] Ready ({:?})", config.brand);
 
-        // ── Command loop ─────────────────────────────────────────────────────
+        // ── Command loop ────────────────────────────────────────────────────
         'cmd: loop {
-            // Reconnect if the user changed the TV config
             let current_ip = {
                 let c = tv_config.lock().await;
                 c.ip.clone()
@@ -222,7 +322,6 @@ pub async fn tv_task(
                 DuckCommand::None => continue,
 
                 DuckCommand::VolumeDown => {
-                    // Capture original volume before the first step (absolute-volume brands only)
                     let needs_query = {
                         let eng = engine.lock().await;
                         eng.original_volume.is_none() && brand.supports_absolute_volume()
@@ -237,7 +336,7 @@ pub async fn tv_task(
 
                     let ok = tv_volume_down(brand, &mut socket, &mut out_frame, &config).await;
                     if !ok { warn!("[tv] VolumeDown failed — reconnecting"); break 'cmd; }
-                    info!("[tv] Volume ↓");
+                    info!("[tv] Volume down");
                 }
 
                 DuckCommand::Restore => {
@@ -257,7 +356,12 @@ pub async fn tv_task(
                         tv_ramp_up_relative(brand, &mut socket, &mut out_frame, &config, steps).await
                     };
 
-                    if !ok { warn!("[tv] Restore failed — reconnecting"); break 'cmd; }
+                    if !ok {
+                        warn!("[tv] Restore failed — clearing duck state, reconnecting");
+                        let mut eng = engine.lock().await;
+                        eng.clear_duck_state();
+                        break 'cmd;
+                    }
                     info!("[tv] Volume restored");
 
                     let mut eng = engine.lock().await;
@@ -270,7 +374,7 @@ pub async fn tv_task(
     }
 }
 
-// ── Ramp helpers ──────────────────────────────────────────────────────────────
+// ── Ramp helpers ────────────────────────────────────────────────────────────
 
 async fn tv_ramp_up_absolute(
     brand: TvBrand, socket: &mut TcpSocket<'_>, out: &mut [u8; 512],
@@ -281,7 +385,7 @@ async fn tv_ramp_up_absolute(
     for i in 1..=steps {
         let vol = current + i;
         if !tv_set_volume(brand, socket, out, cfg, vol).await { return false; }
-        info!("[tv] Ramp → {}", vol);
+        info!("[tv] Ramp -> {}", vol);
         if i < steps { Timer::after(Duration::from_millis(RESTORE_STEP_MS)).await; }
     }
     true
@@ -299,13 +403,13 @@ async fn tv_ramp_up_relative(
     true
 }
 
-// ── Brand dispatch ─────────────────────────────────────────────────────────────
+// ── Brand dispatch ──────────────────────────────────────────────────────────
 
 async fn tv_get_volume(brand: TvBrand, s: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &TvConfig) -> Option<u8> {
     match brand {
         TvBrand::Lg      => lg_get_volume(s, out).await,
         TvBrand::Sony    => sony_get_volume(s, out, cfg).await,
-        TvBrand::Samsung | TvBrand::Roku => None, // no absolute volume API
+        TvBrand::Samsung | TvBrand::Roku => None,
     }
 }
 
@@ -335,8 +439,7 @@ async fn tv_set_volume(brand: TvBrand, s: &mut TcpSocket<'_>, out: &mut [u8; 512
     }
 }
 
-// ── LG WebOS ──────────────────────────────────────────────────────────────────
-// ssap:// WebSocket on port 3000. Pairing popup on TV (once). Absolute volume.
+// ── LG WebOS ────────────────────────────────────────────────────────────────
 
 const LG_PAIR_MSG: &str = r#"{
   "type":"register","id":"reg_1",
@@ -396,11 +499,7 @@ async fn lg_set_volume(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], vol: u8)
     socket.write_all(&out[..n]).await.is_ok()
 }
 
-// ── Samsung Tizen (port 8001, plain WS) ────────────────────────────────────────
-// Key-press remote control only. No absolute volume via WS API.
-// First connect: TV shows approval popup. Returns pairing token (stored in TvConfig).
-// Subsequent connects within same session: include token in URL, no popup.
-// Port 8002 (WSS/TLS) not supported yet — requires embedded-tls (Phase 3).
+// ── Samsung Tizen ───────────────────────────────────────────────────────────
 
 async fn samsung_connect(
     socket: &mut TcpSocket<'_>,
@@ -409,7 +508,6 @@ async fn samsung_connect(
     existing_token: &heapless::String<16>,
     out: &mut [u8; 512],
 ) -> Option<heapless::String<16>> {
-    // Build the WS upgrade path — include token if we have one from a previous connect
     let mut path: heapless::String<128> = heapless::String::new();
     if existing_token.is_empty() {
         let _ = core::write!(path, "/api/v2/channels/samsung.remote.control?name={}", SAMSUNG_APP_B64);
@@ -423,9 +521,7 @@ async fn samsung_connect(
 
     if !client_ws_handshake(socket, host, port, path.as_str()).await { return None; }
 
-    // Wait up to 30 seconds for the user to approve on the TV
-    // (or immediately if token already accepted)
-    info!("[tv/samsung] Waiting for TV pairing event (approve on screen if prompted)…");
+    info!("[tv/samsung] Waiting for TV pairing event…");
     let mut ws_buf = [0u8; 512];
     let frame_len = match with_timeout(
         Duration::from_secs(30),
@@ -445,27 +541,23 @@ async fn samsung_connect(
         return None;
     }
     if !frame.contains("ms.channel.connect") {
-        warn!("[tv/samsung] Unexpected event: {}", frame);
+        warn!("[tv/samsung] Unexpected event");
         return None;
     }
 
-    // Extract token — present as "token":"<digits>" in the response JSON
     let mut token: heapless::String<16> = heapless::String::new();
     if let Some(tok) = parse_json_str(frame, "\"token\":") {
         let _ = token.push_str(tok);
-        info!("[tv/samsung] Paired. Token: {}", tok);
+        info!("[tv/samsung] Paired (token len={})", tok.len());
     } else {
         info!("[tv/samsung] Connected (no token — older TV)");
     }
 
-    // Signal that the out buffer is available (we used ws_buf for the response)
-    let _ = out; // suppress unused warning
+    let _ = out;
     Some(token)
 }
 
 async fn samsung_key(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], key: &str) -> bool {
-    // Samsung Smart Remote WS key-press payload
-    // Cmd: "Click" sends a press+release. Option must be the string "false".
     let mut msg: heapless::String<192> = heapless::String::new();
     let _ = core::write!(
         msg,
@@ -476,22 +568,14 @@ async fn samsung_key(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], key: &str)
     socket.write_all(&out[..n]).await.is_ok()
 }
 
-// ── Sony Bravia REST JSON-RPC ─────────────────────────────────────────────────
-// Plain HTTP on port 80. Auth: X-Auth-PSK header with user's pre-configured key.
-// User sets PSK in TV: Settings → Network → Home Network Setup → IP Control
-//   → Authentication → Normal and Pre-Shared Key → set a key (e.g. "1234").
-// Absolute volume: getVolumeInformation + setAudioVolume v1.2 (volume as string!).
+// ── Sony Bravia ─────────────────────────────────────────────────────────────
 
 async fn sony_get_volume(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &TvConfig) -> Option<u8> {
     const BODY: &str = r#"{"method":"getVolumeInformation","id":33,"params":[],"version":"1.0"}"#;
     sony_http_post(socket, out, &cfg.ip, &cfg.sony_psk, BODY).await?;
-
-    // Parse response: find "speaker" target, then its "volume" value
     let resp = core::str::from_utf8(out).ok()?;
     let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
     let body = &resp[body_start..];
-
-    // Body: {"result":[[{"target":"speaker","volume":25,...}]],"id":33}
     let speaker_pos = body.find(r#""speaker""#)?;
     let vol_key = r#""volume":"#;
     let vol_pos = speaker_pos + body[speaker_pos..].find(vol_key)?;
@@ -501,7 +585,6 @@ async fn sony_get_volume(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &
 }
 
 async fn sony_set_volume(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &TvConfig, vol: u8) -> bool {
-    // v1.2 API: volume field must be a JSON string, not a number
     let mut body: heapless::String<128> = heapless::String::new();
     let _ = core::write!(
         body,
@@ -512,9 +595,6 @@ async fn sony_set_volume(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &
 }
 
 async fn sony_volume_step(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &TvConfig, up: bool) -> bool {
-    // Sony doesn't have a relative step command — get current and set current±1
-    // This is only called in the Samsung/Roku-style relative-ramp path, which
-    // shouldn't happen for Sony (supports_absolute_volume = true). But handle it gracefully.
     if let Some(vol) = sony_get_volume(socket, out, cfg).await {
         let new_vol = if up { vol.saturating_add(1).min(100) } else { vol.saturating_sub(1) };
         sony_set_volume(socket, out, cfg, new_vol).await
@@ -523,8 +603,6 @@ async fn sony_volume_step(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: 
     }
 }
 
-/// Send a JSON-RPC request to /sony/audio and read the HTTP response into `out`.
-/// Returns Some(&out) on HTTP 200, None on error.
 async fn sony_http_post<'b>(
     socket: &mut TcpSocket<'_>,
     out: &'b mut [u8; 512],
@@ -532,7 +610,6 @@ async fn sony_http_post<'b>(
     psk: &str,
     body: &str,
 ) -> Option<&'b [u8]> {
-    // Send headers separately from body to avoid one large stack allocation
     let mut headers: heapless::String<256> = heapless::String::new();
     let _ = core::write!(
         headers,
@@ -549,13 +626,10 @@ async fn sony_http_post<'b>(
     socket.write_all(body.as_bytes()).await.ok()?;
 
     let n = read_http_response(socket, out).await?;
-    // Confirm HTTP 200
     if out[..n.min(12)].starts_with(b"HTTP/1.1 200") { Some(&out[..n]) } else { None }
 }
 
-// ── Roku ECP (External Control Protocol) ────────────────────────────────────────
-// Plain HTTP POST on port 8060. No auth. No body. No absolute volume.
-// Only works on Roku TV (the television sets), not Roku streaming sticks.
+// ── Roku ECP ────────────────────────────────────────────────────────────────
 
 async fn roku_key(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &TvConfig, key: &str) -> bool {
     let mut req: heapless::String<128> = heapless::String::new();
@@ -565,15 +639,25 @@ async fn roku_key(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &TvConfi
         key, cfg.ip.as_str()
     );
     if socket.write_all(req.as_bytes()).await.is_err() { return false; }
-    // Drain the response (HTTP 200, empty body) — ignore errors
-    let _ = read_http_response(socket, out).await;
-    true
+    let resp_result = read_http_response(socket, out).await;
+    match resp_result {
+        Some(n) => {
+            let status_ok = n >= 12 && (out[..12].starts_with(b"HTTP/1.1 200") || out[..12].starts_with(b"HTTP/1.1 204"));
+            if !status_ok {
+                warn!("[tv/roku] Non-2xx response");
+                return false;
+            }
+            true
+        }
+        None => {
+            warn!("[tv/roku] No response (connection lost)");
+            false
+        }
+    }
 }
 
-// ── Low-level helpers ─────────────────────────────────────────────────────────
+// ── Low-level helpers ───────────────────────────────────────────────────────
 
-/// HTTP Upgrade handshake for WebSocket client connections.
-/// `path` is the full request path including query string, e.g. "/api/v2/channels/...?name=..."
 async fn client_ws_handshake(socket: &mut TcpSocket<'_>, host: &str, port: u16, path: &str) -> bool {
     let mut req: heapless::String<384> = heapless::String::new();
     let _ = core::write!(
@@ -600,11 +684,8 @@ async fn client_ws_handshake(socket: &mut TcpSocket<'_>, host: &str, port: u16, 
     buf[..len].starts_with(b"HTTP/1.1 101")
 }
 
-/// Read an HTTP response (headers + body) into `buf`. Returns bytes read.
 async fn read_http_response(socket: &mut TcpSocket<'_>, buf: &mut [u8; 512]) -> Option<usize> {
     let mut len = 0usize;
-
-    // Read until we have complete headers (\r\n\r\n)
     loop {
         match socket.read(&mut buf[len..]).await {
             Ok(0) | Err(_) => { if len == 0 { return None; } break; }
@@ -616,7 +697,6 @@ async fn read_http_response(socket: &mut TcpSocket<'_>, buf: &mut [u8; 512]) -> 
         }
     }
 
-    // Parse Content-Length and read remaining body bytes if needed
     let header_text = core::str::from_utf8(&buf[..len.min(400)]).unwrap_or("");
     if let Some(cl) = header_text.lines()
         .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
@@ -637,7 +717,6 @@ async fn read_http_response(socket: &mut TcpSocket<'_>, buf: &mut [u8; 512]) -> 
     Some(len)
 }
 
-/// Read a WebSocket frame into `buf`. Returns payload length.
 async fn read_ws_frame(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Option<usize> {
     let mut hdr = [0u8; 2];
     read_exact(socket, &mut hdr).await?;
@@ -667,7 +746,6 @@ async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Option<()> {
     Some(())
 }
 
-/// Encode a WebSocket text frame (server-side, unmasked).
 fn ws_frame_unmasked(payload: &[u8], out: &mut [u8]) -> usize {
     let len = payload.len();
     let hlen = if len < 126 { 2 } else { 4 };
@@ -692,7 +770,6 @@ fn parse_volume_from_json(json: &[u8]) -> Option<u8> {
     rest[..end].parse().ok()
 }
 
-/// Extract a quoted JSON string value: find `key` then the next `"..."`.
 fn parse_json_str<'a>(s: &'a str, key: &str) -> Option<&'a str> {
     let pos   = s.find(key)?;
     let after = &s[pos + key.len()..];
@@ -701,11 +778,11 @@ fn parse_json_str<'a>(s: &'a str, key: &str) -> Option<&'a str> {
     Some(&inner[..end])
 }
 
-fn parse_ip(s: &str) -> Option<embassy_net::IpAddress> {
+fn parse_ip(s: &str) -> Option<IpAddress> {
     let mut p = s.splitn(4, '.');
     let a = p.next()?.parse::<u8>().ok()?;
     let b = p.next()?.parse::<u8>().ok()?;
     let c = p.next()?.parse::<u8>().ok()?;
     let d = p.next()?.parse::<u8>().ok()?;
-    Some(embassy_net::IpAddress::v4(a, b, c, d))
+    Some(IpAddress::v4(a, b, c, d))
 }

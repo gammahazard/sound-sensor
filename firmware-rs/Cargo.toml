@@ -1,6 +1,6 @@
 [package]
 name    = "guardian"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Guardian Project"]
 
@@ -56,6 +56,12 @@ portable-atomic = { version = "1", features = ["critical-section"] }
 
 # Math (used in audio.rs for log10/sqrt in no_std)
 libm = "0.2"
+
+# PIO assembly (used in audio.rs)
+pio-proc = "0.2"
+
+# Cortex-M (for SCB::sys_reset)
+cortex-m = "0.7"
 
 # ── Build profile ─────────────────────────────────────────────────────────────
 [profile.release]

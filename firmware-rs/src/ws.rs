@@ -1,29 +1,30 @@
-//! ws.rs — WebSocket server task
-//!
-//! Listens on TCP port 81. Accepts one connection and broadcasts dBFS readings.
-//! Handles incoming control commands.
+//! ws.rs — WebSocket server task (port 81)
 //!
 //! Server → Client (every 100ms):
-//!   {"db":-32.5,"armed":false,"tripwire":-20.0,"fw":"0.2.0","pwa":"1.0.0"}
+//!   {"db":-32.5,"armed":false,"tripwire":-20.0,"ducking":false,"fw":"0.3.0","pwa":"0.1.0"}
+//!
+//! Events:
+//!   {"evt":"wifi_scan","networks":[...]}
+//!   {"evt":"discovered","tvs":[...]}
+//!   {"evt":"ota_status","checking":bool,"available":bool,...}
+//!   {"evt":"wifi_reconfiguring","ssid":"..."}
 //!
 //! Client → Server commands:
-//!   {"cmd":"arm"}
-//!   {"cmd":"disarm"}
-//!   {"cmd":"calibrate_silence","db":-42.0}   ← sets floor to the db value
-//!   {"cmd":"calibrate_max","db":-28.5}        ← sets tripwire to db - 3.0
-//!   {"threshold":-18.0}                       ← manual override
-//!   {"cmd":"set_tv","ip":"192.168.1.5","brand":"lg"}  ← TV selection from PWA
+//!   arm, disarm, calibrate_silence, calibrate_max, threshold,
+//!   scan_wifi, set_wifi, set_tv, discover_tvs, ota_check
 
 use defmt::*;
 use embassy_futures::select::{select, Either};
-use embassy_net::{Stack, TcpSocket};
+use embassy_net::Stack;
+use embassy_net::TcpSocket;
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Timer};
 use cyw43_pio::NetDriver;
 
 use crate::{
-    DB_CHANNEL,
-    ducking::{DuckCommand, DuckingEngine},
+    DB_CHANNEL, LED_CHANNEL, WIFI_CMD_CH, WIFI_EVT_CH,
+    LedPattern, WifiCmd, WifiEvent,
+    ducking::{DuckCommand, DuckingEngine, DuckingState},
     tv::{TvBrand, TvConfig},
 };
 
@@ -57,12 +58,12 @@ pub async fn websocket_task(
             continue;
         }
 
-        handle_client(socket, engine, tv_config).await;
+        handle_client(socket, stack, engine, tv_config).await;
         info!("[ws] Client disconnected");
     }
 }
 
-// ── Handshake ─────────────────────────────────────────────────────────────────
+// ── Handshake ─────────────────────────────────────────────────────────────
 
 async fn ws_handshake(socket: &mut TcpSocket<'_>) -> bool {
     let mut buf = [0u8; 512];
@@ -98,43 +99,61 @@ async fn ws_handshake(socket: &mut TcpSocket<'_>) -> bool {
     socket.write_all(resp.as_bytes()).await.is_ok()
 }
 
-// ── Per-client handler ────────────────────────────────────────────────────────
+// ── Per-client handler ──────────────────────────────────────────────────────
 
 async fn handle_client(
     mut socket: TcpSocket<'_>,
+    stack: &'static Stack<NetDriver<'static>>,
     engine:    &'static Mutex<ThreadModeRawMutex, DuckingEngine>,
     tv_config: &'static Mutex<ThreadModeRawMutex, TvConfig>,
 ) {
-    let mut out_frame = [0u8; 256];
-    let mut last_db   = -60.0f32;
+    let mut out_frame = [0u8; 1100];
+    let mut last_db = -60.0f32;
 
     loop {
-        let mut rx_buf = [0u8; 128];
+        let mut rx_buf = [0u8; 384];
 
-        // Race: either a new dB reading arrives or the client sends a command.
-        // This replaces the old "send then zero-timeout poll" which never worked,
-        // because with_timeout(0ms, socket.read()) always fires the timer first.
         match select(DB_CHANNEL.receive(), socket.read(&mut rx_buf)).await {
 
             Either::First(db) => {
                 last_db = db;
 
-                // Tick ducking engine; grab armed/tripwire in the same lock
-                let (duck_cmd, armed, tripwire) = {
+                // Tick ducking engine
+                let (duck_cmd, armed, tripwire, ducking) = {
                     let mut eng = engine.lock().await;
                     let cmd = eng.tick(db);
-                    (cmd, eng.armed, eng.tripwire_db)
+                    let ducking = eng.state() == DuckingState::Ducking;
+                    (cmd, eng.armed, eng.tripwire_db, ducking)
                 };
+
+                // Update LED pattern based on state
+                if ducking {
+                    let _ = LED_CHANNEL.try_send(LedPattern::Ducking);
+                } else if armed {
+                    let _ = LED_CHANNEL.try_send(LedPattern::Armed);
+                }
+
                 if duck_cmd != DuckCommand::None {
                     crate::tv::send_duck_command(duck_cmd).await;
                 }
 
-                // Broadcast JSON to client
-                let mut json: heapless::String<128> = heapless::String::new();
+                // Check for WiFi scan results to forward
+                if let Ok(evt) = WIFI_EVT_CH.try_receive() {
+                    match evt {
+                        WifiEvent::ScanResults(networks) => {
+                            let json = format_wifi_scan(&networks);
+                            let n = ws_text_frame(json.as_bytes(), &mut out_frame);
+                            if socket.write_all(&out_frame[..n]).await.is_err() { break; }
+                        }
+                    }
+                }
+
+                // Broadcast telemetry
+                let mut json: heapless::String<192> = heapless::String::new();
                 let _ = core::write!(
                     json,
-                    r#"{{"db":{:.2},"armed":{},"tripwire":{:.2},"fw":"{}","pwa":"{}"}}"#,
-                    db, armed, tripwire,
+                    r#"{{"db":{:.2},"armed":{},"tripwire":{:.2},"ducking":{},"fw":"{}","pwa":"{}"}}"#,
+                    db, armed, tripwire, ducking,
                     crate::FW_VERSION,
                     crate::PWA_VERSION,
                 );
@@ -145,11 +164,10 @@ async fn handle_client(
             }
 
             Either::Second(Ok(n)) if n > 0 => {
-                // Client sent a command frame — decode WS framing and apply
-                process_frame(&rx_buf[..n], engine, tv_config, last_db).await;
+                process_frame(&rx_buf[..n], stack, engine, tv_config, last_db, &mut socket, &mut out_frame).await;
             }
 
-            Either::Second(_) => break, // socket closed or errored
+            Either::Second(_) => break,
         }
     }
 }
@@ -157,20 +175,36 @@ async fn handle_client(
 /// Unmask an incoming WS frame and dispatch the JSON payload.
 async fn process_frame(
     raw:       &[u8],
+    stack:     &'static Stack<NetDriver<'static>>,
     engine:    &'static Mutex<ThreadModeRawMutex, DuckingEngine>,
     tv_config: &'static Mutex<ThreadModeRawMutex, TvConfig>,
     last_db:   f32,
+    socket:    &mut TcpSocket<'_>,
+    out_frame: &mut [u8; 1100],
 ) {
     if raw.len() < 2 { return; }
     let masked  = (raw[1] & 0x80) != 0;
     let raw_len = (raw[1] & 0x7F) as usize;
-    let hlen    = 2 + if masked { 4 } else { 0 };
-    if raw_len >= 126 || raw.len() < hlen + raw_len { return; }
 
-    let mut payload = [0u8; 64];
-    let plen = raw_len.min(payload.len());
+    // Handle extended length (RFC 6455)
+    let (payload_len, hdr_extra) = if raw_len == 126 {
+        if raw.len() < 4 { return; }
+        let ext = u16::from_be_bytes([raw[2], raw[3]]) as usize;
+        (ext, 2)
+    } else if raw_len == 127 {
+        return; // We don't support 8-byte extended length
+    } else {
+        (raw_len, 0)
+    };
+
+    let mask_offset = 2 + hdr_extra;
+    let hlen = mask_offset + if masked { 4 } else { 0 };
+    if raw.len() < hlen + payload_len { return; }
+
+    let mut payload = [0u8; 384];
+    let plen = payload_len.min(payload.len());
     if masked {
-        let mask = &raw[2..6];
+        let mask = &raw[mask_offset..mask_offset + 4];
         for (i, b) in raw[hlen..hlen + plen].iter().enumerate() {
             payload[i] = b ^ mask[i % 4];
         }
@@ -178,78 +212,166 @@ async fn process_frame(
         payload[..plen].copy_from_slice(&raw[hlen..hlen + plen]);
     }
 
-    apply_command(&payload[..plen], engine, tv_config, last_db).await;
+    apply_command(&payload[..plen], stack, engine, tv_config, last_db, socket, out_frame).await;
 }
 
 async fn apply_command(
     payload:   &[u8],
+    stack:     &'static Stack<NetDriver<'static>>,
     engine:    &'static Mutex<ThreadModeRawMutex, DuckingEngine>,
     tv_config: &'static Mutex<ThreadModeRawMutex, TvConfig>,
     last_db:   f32,
+    socket:    &mut TcpSocket<'_>,
+    out_frame: &mut [u8; 1100],
 ) {
     let Ok(s) = core::str::from_utf8(payload) else { return };
-    let mut eng = engine.lock().await;
 
     if s.contains(r#""cmd":"arm""#) {
+        let mut eng = engine.lock().await;
         eng.arm();
+        let _ = LED_CHANNEL.try_send(LedPattern::Armed);
         info!("[ws] Armed");
 
     } else if s.contains(r#""cmd":"disarm""#) {
+        let mut eng = engine.lock().await;
         eng.disarm();
+        let _ = LED_CHANNEL.try_send(LedPattern::Idle);
         info!("[ws] Disarmed");
 
     } else if s.contains(r#""cmd":"calibrate_silence""#) {
-        // Use the db value from the command if present, else last seen reading
         let db = parse_f32_field(s, r#""db":"#).unwrap_or(last_db);
+        let mut eng = engine.lock().await;
         eng.set_floor(db);
         info!("[ws] Floor set to {} dBFS", db);
 
     } else if s.contains(r#""cmd":"calibrate_max""#) {
-        // Tripwire = TV level − 3 dB headroom
         let db = parse_f32_field(s, r#""db":"#).unwrap_or(last_db);
         let tripwire = db - 3.0;
+        let mut eng = engine.lock().await;
         eng.set_tripwire(tripwire);
         info!("[ws] Tripwire set to {} dBFS (TV at {})", tripwire, db);
 
     } else if s.contains(r#""threshold":"#) {
         if let Some(v) = parse_f32_field(s, r#""threshold":"#) {
+            let mut eng = engine.lock().await;
             eng.set_tripwire(v);
             info!("[ws] Manual tripwire: {}", v);
         }
 
+    } else if s.contains(r#""cmd":"scan_wifi""#) {
+        info!("[ws] WiFi scan requested");
+        let _ = WIFI_CMD_CH.try_send(WifiCmd::Scan);
+
     } else if s.contains(r#""cmd":"set_wifi""#) {
-        // Phase 3: parse ssid/pass, save to flash, reboot into new network.
-        let ssid = parse_str_field(s, r#""ssid":"#).unwrap_or("?");
-        info!("[ws] WiFi change requested → SSID: {}", ssid);
-        // TODO Phase 3: write credentials to flash, trigger soft reboot.
+        let ssid = parse_str_field(s, r#""ssid":"#).unwrap_or("");
+        let pass = parse_str_field(s, r#""pass":"#).unwrap_or("");
+        info!("[ws] WiFi reconfigure → {}", ssid);
+
+        // Send wifi_reconfiguring event back to client
+        let mut evt: heapless::String<128> = heapless::String::new();
+        let _ = core::write!(evt, r#"{{"evt":"wifi_reconfiguring","ssid":"{}"}}"#, ssid);
+        let n = ws_text_frame(evt.as_bytes(), out_frame);
+        let _ = socket.write_all(&out_frame[..n]).await;
+
+        let mut ssid_h: heapless::String<64> = heapless::String::new();
+        let _ = ssid_h.push_str(ssid);
+        let mut pass_h: heapless::String<64> = heapless::String::new();
+        let _ = pass_h.push_str(pass);
+        let _ = WIFI_CMD_CH.try_send(WifiCmd::Reconfigure { ssid: ssid_h, pass: pass_h });
 
     } else if s.contains(r#""cmd":"set_tv""#) {
-        // Release engine lock before taking tv_config lock (avoid lock-order deadlock)
-        drop(eng);
         let ip    = parse_str_field(s, r#""ip":"#);
         let brand = parse_str_field(s, r#""brand":"#).and_then(TvBrand::parse);
-        let psk   = parse_str_field(s, r#""psk":"#);   // optional — Sony PSK
-        if let (Some(ip_str), Some(brand)) = (ip, brand) {
-            let mut cfg = tv_config.lock().await;
-            // Clear session token so tv_task reconnects with fresh pairing
-            cfg.samsung_token.clear();
-            cfg.ip.clear();
-            let _ = cfg.ip.push_str(ip_str);
-            cfg.brand = brand;
-            if let Some(p) = psk {
-                cfg.sony_psk.clear();
-                let _ = cfg.sony_psk.push_str(p);
+        let psk   = parse_str_field(s, r#""psk":"#);
+
+        // Disconnect case: ip is empty
+        if let Some(ip_str) = ip {
+            if ip_str.is_empty() {
+                // Clear TV config
+                let cfg_to_save = {
+                    let mut cfg = tv_config.lock().await;
+                    cfg.ip.clear();
+                    cfg.samsung_token.clear();
+                    cfg.sony_psk.clear();
+                    cfg.clone()
+                };
+                if WIFI_CMD_CH.try_send(WifiCmd::SaveTvConfig(cfg_to_save)).is_err() {
+                    warn!("[ws] Failed to send SaveTvConfig (clear)");
+                }
+                info!("[ws] TV disconnected");
+                return;
             }
-            info!("[ws] TV → {} ({:?})", ip_str, brand);
-        } else {
-            warn!("[ws] set_tv: bad ip or unknown brand in: {}", s);
+
+            if let Some(brand) = brand {
+                let cfg_to_save = {
+                    let mut cfg = tv_config.lock().await;
+                    cfg.samsung_token.clear();
+                    cfg.ip.clear();
+                    let _ = cfg.ip.push_str(ip_str);
+                    cfg.brand = brand;
+                    if let Some(p) = psk {
+                        cfg.sony_psk.clear();
+                        let _ = cfg.sony_psk.push_str(&p[..p.len().min(8)]);
+                    }
+                    cfg.clone()
+                };
+                if WIFI_CMD_CH.try_send(WifiCmd::SaveTvConfig(cfg_to_save)).is_err() {
+                    warn!("[ws] Failed to send SaveTvConfig");
+                }
+                info!("[ws] TV → {} ({:?})", ip_str, brand);
+            } else {
+                warn!("[ws] set_tv: unknown brand");
+            }
         }
-        return; // eng already dropped
+
+    } else if s.contains(r#""cmd":"discover_tvs""#) {
+        info!("[ws] TV discovery requested");
+        let tvs = crate::tv::discover_tvs(stack).await;
+        let json = format_discovered_tvs(&tvs);
+        let n = ws_text_frame(json.as_bytes(), out_frame);
+        let _ = socket.write_all(&out_frame[..n]).await;
+
+    } else if s.contains(r#""cmd":"ota_check""#) {
+        info!("[ws] OTA check requested");
+        let result = crate::ota::check_for_update().await;
+        let json = crate::ota::status_json(
+            false,
+            result.available,
+            result.current.as_str(),
+            result.latest.as_str(),
+            false,
+        );
+        let n = ws_text_frame(json.as_bytes(), out_frame);
+        let _ = socket.write_all(&out_frame[..n]).await;
     }
-    // eng drops here in all other branches
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Event formatters ────────────────────────────────────────────────────────
+
+fn format_wifi_scan(networks: &[crate::NetworkInfo]) -> heapless::String<1024> {
+    let mut s: heapless::String<1024> = heapless::String::new();
+    let _ = s.push_str(r#"{"evt":"wifi_scan","networks":["#);
+    for (i, net) in networks.iter().enumerate() {
+        if i > 0 { let _ = s.push(','); }
+        let _ = core::write!(s, r#"{{"ssid":"{}","rssi":{}}}"#, net.ssid.as_str(), net.rssi);
+    }
+    let _ = s.push_str("]}");
+    s
+}
+
+fn format_discovered_tvs(tvs: &[crate::tv::DiscoveredTv]) -> heapless::String<1024> {
+    let mut s: heapless::String<1024> = heapless::String::new();
+    let _ = s.push_str(r#"{"evt":"discovered","tvs":["#);
+    for (i, tv) in tvs.iter().enumerate() {
+        if i > 0 { let _ = s.push(','); }
+        let _ = core::write!(s, r#"{{"ip":"{}","name":"{}","brand":"{}"}}"#,
+            tv.ip.as_str(), tv.name.as_str(), tv.brand.as_str());
+    }
+    let _ = s.push_str("]}");
+    s
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn parse_f32_field(s: &str, key: &str) -> Option<f32> {
     let pos  = s.find(key)?;
@@ -267,7 +389,7 @@ fn parse_str_field<'a>(s: &'a str, key: &str) -> Option<&'a str> {
     Some(&inner[..end])
 }
 
-// ── WebSocket frame encoder ───────────────────────────────────────────────────
+// ── WebSocket frame encoder ─────────────────────────────────────────────────
 
 fn ws_text_frame(payload: &[u8], out: &mut [u8]) -> usize {
     let len  = payload.len();
@@ -284,7 +406,7 @@ fn ws_text_frame(payload: &[u8], out: &mut [u8]) -> usize {
     hlen + len
 }
 
-// ── SHA-1 (inline, no_std) ────────────────────────────────────────────────────
+// ── SHA-1 (inline, no_std) ──────────────────────────────────────────────────
 
 fn ws_accept_header(key: &str) -> heapless::String<32> {
     const GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";

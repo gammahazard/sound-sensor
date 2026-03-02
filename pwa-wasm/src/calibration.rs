@@ -5,7 +5,6 @@
 //!   Step 2: Record TV at preferred max → sets tripwire 3 dB below
 
 use leptos::*;
-use wasm_bindgen::JsCast;
 
 fn local_get_f32(key: &str, default: f32) -> f32 {
     web_sys::window()
@@ -26,19 +25,14 @@ fn local_set_f32(key: &str, val: f32) {
     }
 }
 
-// ── Calibration screen ────────────────────────────────────────────────────────
+// ── Calibration screen ──────────────────────────────────────────────────────
 
 #[component]
 pub fn CalibrationScreen(
     current_db:   ReadSignal<f32>,
     tripwire:     ReadSignal<f32>,
-    /// Called with the current dB when Step 1 is tapped.
-    /// Caller sends {"cmd":"calibrate_silence","db":X} to firmware.
     on_silence:   impl Fn(f32) + 'static,
-    /// Called with the current dB when Step 2 is tapped.
-    /// Caller sends {"cmd":"calibrate_max","db":X} to firmware.
     on_max:       impl Fn(f32) + 'static,
-    /// Called with the new threshold value when Apply is tapped.
     on_threshold: impl Fn(f32) + 'static,
 ) -> impl IntoView {
     let on_silence   = store_value(on_silence);
@@ -51,7 +45,6 @@ pub fn CalibrationScreen(
     let (max_db,       set_max_db)        = create_signal(local_get_f32("max",      -20.0));
     let (slider_val,   set_slider_val)    = create_signal(local_get_f32("tripwire", -20.0));
 
-    // Sync slider when tripwire signal updates from server
     create_effect(move |_| {
         set_slider_val(tripwire.get());
     });
@@ -66,12 +59,22 @@ pub fn CalibrationScreen(
                 </div>
             </div>
 
-            // ── Step 1: Silence ───────────────────────────────────────────────
+            // ── Placement reminder ──────────────────────────────────────────
+            <div style="background:#1e3a5f;border-radius:16px;padding:14px;\
+                        display:flex;flex-direction:column;gap:4px">
+                <div style="font-weight:700;color:#93c5fd">"Sensor Placement"</div>
+                <div style="font-size:12px;color:#bfdbfe">
+                    "Place the Guardian sensor where the baby/child usually is — "
+                    "not next to the TV. The sensor should hear what the child hears."
+                </div>
+            </div>
+
+            // ── Step 1: Silence ─────────────────────────────────────────────
             <CalStep
                 number=1
                 done=silence_done
                 title="Record Silence"
-                description="Quiet room — no TV, no talking. Tap the button."
+                description="Quiet room — TV off, no talking. Measures ambient noise floor."
             >
                 <button
                     on:click=move |_| {
@@ -100,12 +103,12 @@ pub fn CalibrationScreen(
                 </div>
             </CalStep>
 
-            // ── Step 2: Max volume ────────────────────────────────────────────
+            // ── Step 2: Max volume ──────────────────────────────────────────
             <CalStep
                 number=2
                 done=max_done
                 title="Set Max Comfortable Volume"
-                description="Turn TV to your preferred maximum. Tap the button."
+                description="Turn TV to your preferred maximum. This sets the trigger threshold."
             >
                 <button
                     on:click=move |_| {
@@ -137,7 +140,7 @@ pub fn CalibrationScreen(
                 </div>
             </CalStep>
 
-            // ── Manual threshold ──────────────────────────────────────────────
+            // ── Manual threshold ────────────────────────────────────────────
             <div style="background:#1e293b;border-radius:16px;padding:16px">
                 <div style="font-weight:600;margin-bottom:12px">"Manual Threshold"</div>
                 <div style="display:flex;align-items:center;gap:12px">
@@ -170,19 +173,31 @@ pub fn CalibrationScreen(
                 </button>
             </div>
 
-            // ── 3-second rule note ────────────────────────────────────────────
+            // ── How it works note ────────────────────────────────────────────
             <div style="background:#1e293b;border-radius:16px;padding:12px;\
-                        font-size:12px;color:#94a3b8">
-                <strong style="color:#f1f5f9">"3-Second Rule: "</strong>
-                "Ducking only fires after sustained loud noise for 3 seconds — "
-                "brief sounds (footsteps, doors) are ignored."
+                        font-size:12px;color:#94a3b8;display:flex;flex-direction:column;gap:8px">
+                <div>
+                    <strong style="color:#f1f5f9">"3-Second Rule: "</strong>
+                    "Ducking only fires after sustained loud noise for 3 seconds — "
+                    "brief sounds (footsteps, doors) are ignored."
+                </div>
+                <div>
+                    <strong style="color:#f1f5f9">"Auto-Restore: "</strong>
+                    "Volume returns to normal ~30 seconds after the loud scene ends. "
+                    "If the room goes completely quiet, it restores immediately."
+                </div>
+                <div>
+                    <strong style="color:#f1f5f9">"Minimum Gap: "</strong>
+                    "The tripwire is always at least 6 dB above the quiet level "
+                    "to prevent false triggers during normal viewing."
+                </div>
             </div>
 
         </div>
     }
 }
 
-// ── Step card ─────────────────────────────────────────────────────────────────
+// ── Step card ───────────────────────────────────────────────────────────────
 
 #[component]
 fn CalStep(

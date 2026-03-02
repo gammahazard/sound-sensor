@@ -18,7 +18,8 @@
       "WebFetch(domain:philipstv.readthedocs.io)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:androidtv.readthedocs.io)",
-      "Bash(rustc:*)"
+      "Bash(rustc:*)",
+      "Bash(echo EXIT: $?:*)"
     ]
   }
 }

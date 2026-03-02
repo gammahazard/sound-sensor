@@ -1,18 +1,21 @@
 //! wifi.rs — WiFi settings screen (Leptos)
 //!
-//! Shows current connection info and lets the user enter new WiFi credentials.
-//! Sends {"cmd":"set_wifi","ssid":"...","pass":"..."} to the firmware.
-//! Full captive-portal switching is a Phase 3 firmware feature; the UI exists now.
+//! Shows current connection, scan button, network list, and credentials form.
 
 use leptos::*;
 use wasm_bindgen::JsCast;
+use crate::ws::{WsState, NetworkInfo, rssi_bars};
 
-// ── WiFi screen ───────────────────────────────────────────────────────────────
+// ── WiFi screen ─────────────────────────────────────────────────────────────
 
 #[component]
 pub fn WifiScreen(
-    on_reconfigure: impl Fn(String, String) + 'static,  // (ssid, pass)
+    ws_state:       ReadSignal<WsState>,
+    wifi_networks:  ReadSignal<Vec<NetworkInfo>>,
+    on_scan:        impl Fn() + 'static,
+    on_reconfigure: impl Fn(String, String) + 'static,
 ) -> impl IntoView {
+    let on_scan        = store_value(on_scan);
     let on_reconfigure = store_value(on_reconfigure);
 
     let current_host = web_sys::window()
@@ -21,6 +24,15 @@ pub fn WifiScreen(
 
     let (result_msg, set_result)    = create_signal(String::new());
     let (result_ok,  set_result_ok) = create_signal(false);
+    let (scanning, set_scanning)    = create_signal(false);
+
+    // Clear scanning when results arrive (avoids setting signal in reactive closure)
+    create_effect(move |_| {
+        let nets = wifi_networks.get();
+        if !nets.is_empty() {
+            set_scanning(false);
+        }
+    });
 
     view! {
         <div style="padding:16px;display:flex;flex-direction:column;gap:16px">
@@ -32,7 +44,7 @@ pub fn WifiScreen(
                 </div>
             </div>
 
-            // ── Current connection ────────────────────────────────────────────
+            // ── Current connection ──────────────────────────────────────────
             <div style="background:#1e293b;border-radius:16px;padding:16px;display:flex;\
                         flex-direction:column;gap:10px">
                 <div style="font-weight:700;margin-bottom:2px">"Current Connection"</div>
@@ -44,11 +56,86 @@ pub fn WifiScreen(
                 </div>
                 <div style="display:flex;justify-content:space-between;align-items:center">
                     <span style="font-size:13px;color:#94a3b8">"Status"</span>
-                    <span style="font-size:13px;font-weight:600;color:#22c55e">"Connected"</span>
+                    <span style=move || format!(
+                        "font-size:13px;font-weight:600;color:{}",
+                        match ws_state.get() {
+                            WsState::Connected    => "#22c55e",
+                            WsState::Connecting   => "#eab308",
+                            WsState::Disconnected => "#ef4444",
+                        }
+                    )>
+                        {move || match ws_state.get() {
+                            WsState::Connected    => "Connected",
+                            WsState::Connecting   => "Connecting…",
+                            WsState::Disconnected => "Disconnected",
+                        }}
+                    </span>
                 </div>
             </div>
 
-            // ── Change network ────────────────────────────────────────────────
+            // ── Scan button + network list ──────────────────────────────────
+            <div style="background:#1e293b;border-radius:16px;padding:16px;display:flex;\
+                        flex-direction:column;gap:12px">
+                <div style="font-weight:700">"Available Networks"</div>
+                <button
+                    on:click=move |_| {
+                        set_scanning(true);
+                        on_scan.get_value()();
+                        let set_s = set_scanning.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            gloo_timers::future::TimeoutFuture::new(8_000).await;
+                            set_s(false);
+                        });
+                    }
+                    disabled=move || scanning.get()
+                    style=move || format!(
+                        "width:100%;padding:10px;border-radius:12px;border:1px solid #475569;\
+                         background:transparent;color:{};font-size:13px;\
+                         font-weight:600;cursor:pointer",
+                        if scanning.get() { "#475569" } else { "#93c5fd" }
+                    )
+                >
+                    {move || if scanning.get() { "Scanning…" } else { "Scan WiFi Networks" }}
+                </button>
+
+                {move || {
+                    let nets = wifi_networks.get();
+                    if nets.is_empty() {
+                        if !scanning.get() && scanning.get_untracked() == scanning.get() {
+                            // Don't show message while scan hasn't been triggered yet
+                        }
+                        return ().into_view();
+                    }
+                    view! {
+                        <div style="display:flex;flex-direction:column;gap:6px">
+                            {nets.iter().map(|net| {
+                                let ssid = net.ssid.clone();
+                                let rssi = net.rssi;
+                                let ssid2 = ssid.clone();
+                                view! {
+                                    <button
+                                        on:click=move |_| {
+                                            set_input_value("wifi-ssid", &ssid2);
+                                        }
+                                        style="text-align:left;width:100%;padding:8px 12px;\
+                                               border-radius:8px;border:1px solid #334155;\
+                                               background:#0f172a;color:#f1f5f9;\
+                                               cursor:pointer;display:flex;\
+                                               justify-content:space-between;align-items:center"
+                                    >
+                                        <span style="font-size:13px">{ssid}</span>
+                                        <span style="font-size:11px;color:#475569;font-family:monospace">
+                                            {rssi_bars(rssi)}
+                                        </span>
+                                    </button>
+                                }
+                            }).collect_view()}
+                        </div>
+                    }.into_view()
+                }}
+            </div>
+
+            // ── Change network ──────────────────────────────────────────────
             <div style="background:#1e293b;border-radius:16px;padding:16px;display:flex;\
                         flex-direction:column;gap:14px">
                 <div>
@@ -116,7 +203,7 @@ pub fn WifiScreen(
                 </button>
             </div>
 
-            // ── Note ──────────────────────────────────────────────────────────
+            // ── Note ────────────────────────────────────────────────────────
             <div style="background:#1e293b;border-radius:16px;padding:12px;\
                         font-size:12px;color:#94a3b8">
                 <strong style="color:#f1f5f9">"Note: "</strong>
@@ -128,7 +215,7 @@ pub fn WifiScreen(
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn get_input_value(id: &str) -> String {
     web_sys::window()
@@ -137,4 +224,14 @@ fn get_input_value(id: &str) -> String {
         .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
         .map(|el| el.value().trim().to_string())
         .unwrap_or_default()
+}
+
+fn set_input_value(id: &str, val: &str) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+    {
+        el.set_value(val);
+    }
 }

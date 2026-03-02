@@ -1,11 +1,11 @@
 //! tv.rs — TV setup screen (Leptos)
 //!
 //! Brand selection → IP entry → optional Sony PSK → Connect.
-//! Persists config to localStorage (handled by parent via on_connect/on_disconnect).
-//! Shows a "connected" card when a TV is configured, with a Change TV button.
+//! SSDP discover button shows discovered TVs with tap-to-autofill.
 
 use leptos::*;
 use wasm_bindgen::JsCast;
+use crate::ws::DiscoveredTv;
 
 const BRANDS: &[(&str, &str)] = &[
     ("lg",      "LG WebOS"),
@@ -14,31 +14,31 @@ const BRANDS: &[(&str, &str)] = &[
     ("roku",    "Roku"),
 ];
 
-// ── TV screen ─────────────────────────────────────────────────────────────────
+// ── TV screen ───────────────────────────────────────────────────────────────
 
 #[component]
 pub fn TvScreen(
-    // Read signals (initialized by parent from localStorage)
-    tv_ip:        ReadSignal<String>,
-    tv_brand:     ReadSignal<String>,
-    tv_connected: ReadSignal<bool>,
-    // Callbacks: parent sends WS command + saves to localStorage
-    on_connect:    impl Fn(String, String, String) + 'static,  // (ip, brand, psk)
-    on_disconnect: impl Fn() + 'static,
-    // Write signals so this component can update parent state
-    set_tv_ip:        WriteSignal<String>,
-    set_tv_brand:     WriteSignal<String>,
+    tv_ip:          ReadSignal<String>,
+    tv_brand:       ReadSignal<String>,
+    tv_connected:   ReadSignal<bool>,
+    on_connect:     impl Fn(String, String, String) + 'static,
+    on_disconnect:  impl Fn() + 'static,
+    set_tv_ip:      WriteSignal<String>,
+    set_tv_brand:   WriteSignal<String>,
     set_tv_connected: WriteSignal<bool>,
+    discovered_tvs: ReadSignal<Vec<DiscoveredTv>>,
+    on_discover:    impl Fn() + 'static,
 ) -> impl IntoView {
     let on_connect    = store_value(on_connect);
     let on_disconnect = store_value(on_disconnect);
+    let on_discover   = store_value(on_discover);
 
-    // Local signals for the form (not committed until Connect is tapped)
-    let (brand_sel, set_brand_sel) = create_signal(tv_brand.get_untracked());
-    let (result_msg, set_result)   = create_signal(String::new());
-    let (result_ok,  set_result_ok) = create_signal(false);
+    let (brand_sel, set_brand_sel)     = create_signal(tv_brand.get_untracked());
+    let (result_msg, set_result)       = create_signal(String::new());
+    let (result_ok,  set_result_ok)    = create_signal(false);
+    let (discovering, set_discovering) = create_signal(false);
 
-    // ── Connected card ────────────────────────────────────────────────────────
+    // ── Connected card ──────────────────────────────────────────────────────
     let connected_card = move || {
         let brand_label = BRANDS.iter()
             .find(|(k, _)| *k == tv_brand.get().as_str())
@@ -73,9 +73,8 @@ pub fn TvScreen(
         }
     };
 
-    // ── Setup card ────────────────────────────────────────────────────────────
+    // ── Setup card ──────────────────────────────────────────────────────────
     let setup_card = move || {
-        // Brand buttons
         let brand_btns = BRANDS.iter().map(|(key, label)| {
             let key   = *key;
             let label = *label;
@@ -109,6 +108,68 @@ pub fn TvScreen(
                 // Brand buttons
                 <div style="display:flex;gap:8px">{brand_btns}</div>
 
+                // SSDP discover button
+                <button
+                    on:click=move |_| {
+                        set_discovering(true);
+                        on_discover.get_value()();
+                        // Auto-reset after 4s
+                        let set_d = set_discovering.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            gloo_timers::future::TimeoutFuture::new(4_000).await;
+                            set_d(false);
+                        });
+                    }
+                    disabled=move || discovering.get()
+                    style=move || format!(
+                        "width:100%;padding:10px;border-radius:12px;border:1px solid #475569;\
+                         background:transparent;color:{};font-size:13px;\
+                         font-weight:600;cursor:pointer",
+                        if discovering.get() { "#475569" } else { "#93c5fd" }
+                    )
+                >
+                    {move || if discovering.get() { "Scanning network…" } else { "Discover TVs on Network" }}
+                </button>
+
+                // Discovered TV list
+                {move || {
+                    let tvs = discovered_tvs.get();
+                    if tvs.is_empty() { return ().into_view(); }
+                    view! {
+                        <div style="display:flex;flex-direction:column;gap:6px">
+                            <div style="font-size:11px;color:#475569">"FOUND TVs"</div>
+                            {tvs.iter().map(|tv| {
+                                let ip = tv.ip.clone();
+                                let brand = tv.brand.clone();
+                                let name = tv.name.clone();
+                                let ip2 = ip.clone();
+                                let brand2 = brand.clone();
+                                view! {
+                                    <button
+                                        on:click=move |_| {
+                                            set_input_value("tv-ip-input", &ip2);
+                                            set_brand_sel(brand2.clone());
+                                        }
+                                        style="text-align:left;width:100%;padding:10px 12px;\
+                                               border-radius:10px;border:1px solid #334155;\
+                                               background:#0f172a;color:#f1f5f9;\
+                                               cursor:pointer;display:flex;\
+                                               justify-content:space-between;align-items:center"
+                                    >
+                                        <div>
+                                            <div style="font-size:13px;font-weight:600">{name}</div>
+                                            <div style="font-size:11px;color:#94a3b8">{ip.clone()}</div>
+                                        </div>
+                                        <div style="font-size:11px;color:#6366f1;font-weight:600">
+                                            {brand.to_uppercase()}
+                                        </div>
+                                    </button>
+                                }
+                            }).collect_view()}
+                        </div>
+                    }.into_view()
+                }}
+
                 // IP input
                 <div style="display:flex;flex-direction:column;gap:6px">
                     <label style="font-size:12px;color:#94a3b8">"TV IP Address"</label>
@@ -121,11 +182,11 @@ pub fn TvScreen(
                                padding:10px 12px;color:#f1f5f9;font-size:15px;width:100%"
                     />
                     <span style="font-size:11px;color:#475569">
-                        "Find in: Router admin page → DHCP clients"
+                        "Find in: Router admin page or use Discover above"
                     </span>
                 </div>
 
-                // Sony PSK field (shown only when Sony is selected)
+                // Sony PSK field
                 {move || (brand_sel.get() == "sony").then(|| view! {
                     <div style="display:flex;flex-direction:column;gap:6px">
                         <label style="font-size:12px;color:#94a3b8">"Sony Pre-Shared Key"</label>
@@ -241,7 +302,7 @@ pub fn TvScreen(
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn get_input_value(id: &str) -> String {
     web_sys::window()
@@ -250,6 +311,16 @@ fn get_input_value(id: &str) -> String {
         .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
         .map(|el| el.value().trim().to_string())
         .unwrap_or_default()
+}
+
+fn set_input_value(id: &str, val: &str) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+    {
+        el.set_value(val);
+    }
 }
 
 fn is_valid_ip(s: &str) -> bool {

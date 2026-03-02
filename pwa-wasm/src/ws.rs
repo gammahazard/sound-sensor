@@ -13,7 +13,7 @@ use gloo_timers::future::TimeoutFuture;
 const WS_PORT:      u16 = 81;
 const RECONNECT_MS: u32 = 3_000;
 
-// ── Server → Client message ───────────────────────────────────────────────────
+// ── Server → Client message ────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct ServerMsg {
@@ -24,12 +24,57 @@ struct ServerMsg {
     #[serde(default)]
     tripwire: Option<f32>,
     #[serde(default)]
+    ducking:  Option<bool>,
+    #[serde(default)]
     fw:       Option<String>,
     #[serde(default)]
     pwa:      Option<String>,
+    // Event fields
+    #[serde(default)]
+    evt:      Option<String>,
+    #[serde(default)]
+    networks: Option<Vec<NetworkInfo>>,
+    #[serde(default)]
+    tvs:      Option<Vec<DiscoveredTv>>,
+    // OTA fields
+    #[serde(default)]
+    available: Option<bool>,
+    #[serde(default)]
+    latest:   Option<String>,
+    #[serde(default)]
+    current:  Option<String>,
+    #[serde(default)]
+    checking: Option<bool>,
+    // WiFi reconfiguring
+    #[serde(default)]
+    ssid:     Option<String>,
 }
 
-// ── Connection state ──────────────────────────────────────────────────────────
+#[derive(Clone, Deserialize, Debug)]
+pub struct NetworkInfo {
+    pub ssid: String,
+    pub rssi: i16,
+}
+
+#[derive(Clone, Deserialize, Debug)]
+pub struct DiscoveredTv {
+    pub ip:    String,
+    pub name:  String,
+    pub brand: String,
+}
+
+// ── OTA status ──────────────────────────────────────────────────────────────
+
+#[derive(Clone, PartialEq)]
+pub enum OtaStatus {
+    Idle,
+    Checking,
+    Available { latest: String, current: String },
+    UpToDate { current: String },
+    Done { pwa: String },
+}
+
+// ── Connection state ────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum WsState {
@@ -38,7 +83,7 @@ pub enum WsState {
     Disconnected,
 }
 
-// ── Connection banner ─────────────────────────────────────────────────────────
+// ── Connection banner ───────────────────────────────────────────────────────
 
 #[component]
 pub fn ConnectionBanner(state: ReadSignal<WsState>) -> impl IntoView {
@@ -65,18 +110,29 @@ pub fn ConnectionBanner(state: ReadSignal<WsState>) -> impl IntoView {
     }
 }
 
-// ── WebSocket hook ────────────────────────────────────────────────────────────
+// ── RSSI helper ─────────────────────────────────────────────────────────────
 
-/// Spawns the WebSocket reconnect loop and drives all reactive signals.
-/// Returns a `send_fn` closure the caller uses to send raw JSON strings.
+pub fn rssi_bars(rssi: i16) -> &'static str {
+    if rssi > -50 { "████" }
+    else if rssi > -60 { "███░" }
+    else if rssi > -70 { "██░░" }
+    else { "█░░░" }
+}
+
+// ── WebSocket hook ──────────────────────────────────────────────────────────
+
 pub fn use_websocket(
-    set_db:        WriteSignal<f32>,
-    set_armed:     WriteSignal<bool>,
-    set_tripwire:  WriteSignal<f32>,
-    set_ws_state:  WriteSignal<WsState>,
-    set_fw_ver:    WriteSignal<String>,
-    set_pwa_ver:   WriteSignal<String>,
-    set_msg_count: WriteSignal<u32>,
+    set_db:               WriteSignal<f32>,
+    set_armed:            WriteSignal<bool>,
+    set_tripwire:         WriteSignal<f32>,
+    set_ws_state:         WriteSignal<WsState>,
+    set_fw_ver:           WriteSignal<String>,
+    set_pwa_ver:          WriteSignal<String>,
+    set_msg_count:        WriteSignal<u32>,
+    set_ducking:          WriteSignal<bool>,
+    set_wifi_networks:    WriteSignal<Vec<NetworkInfo>>,
+    set_discovered_tvs:   WriteSignal<Vec<DiscoveredTv>>,
+    set_ota_status:       WriteSignal<OtaStatus>,
 ) -> impl Fn(String) + Clone + 'static {
     let (tx, mut rx) = futures::channel::mpsc::unbounded::<String>();
     let tx_send = tx.clone();
@@ -107,10 +163,47 @@ pub fn use_websocket(
                                 match msg {
                                     Some(Ok(Message::Text(text))) => {
                                         if let Ok(m) = serde_json::from_str::<ServerMsg>(&text) {
+                                            // Handle events
+                                            if let Some(evt) = &m.evt {
+                                                match evt.as_str() {
+                                                    "wifi_scan" => {
+                                                        if let Some(nets) = m.networks {
+                                                            set_wifi_networks(nets);
+                                                        }
+                                                    }
+                                                    "discovered" => {
+                                                        if let Some(tvs) = m.tvs {
+                                                            set_discovered_tvs(tvs);
+                                                        }
+                                                    }
+                                                    "ota_status" => {
+                                                        let avail = m.available.unwrap_or(false);
+                                                        let latest = m.latest.clone().unwrap_or_default();
+                                                        let current = m.current.clone().unwrap_or_default();
+                                                        if avail {
+                                                            set_ota_status(OtaStatus::Available { latest, current });
+                                                        } else {
+                                                            set_ota_status(OtaStatus::UpToDate { current });
+                                                        }
+                                                    }
+                                                    "ota_done" => {
+                                                        let pwa = m.pwa.clone().unwrap_or_default();
+                                                        set_ota_status(OtaStatus::Done { pwa });
+                                                    }
+                                                    "wifi_reconfiguring" => {
+                                                        // handled by the UI already
+                                                    }
+                                                    _ => {}
+                                                }
+                                                continue;
+                                            }
+
+                                            // Regular telemetry
                                             set_msg_count.update(|n| *n += 1);
                                             if let Some(v) = m.db       { set_db(v); }
                                             if let Some(v) = m.armed    { set_armed(v); }
                                             if let Some(v) = m.tripwire { set_tripwire(v); }
+                                            if let Some(v) = m.ducking  { set_ducking(v); }
                                             if let Some(v) = m.fw       { set_fw_ver(v); }
                                             if let Some(v) = m.pwa      { set_pwa_ver(v); }
                                         }
@@ -121,7 +214,6 @@ pub fn use_websocket(
                             }
                             outgoing = rx.next() => {
                                 if let Some(msg) = outgoing {
-                                    use gloo_net::websocket::futures::WebSocketSink;
                                     use futures::SinkExt;
                                     let _ = write.send(Message::Text(msg)).await;
                                 }

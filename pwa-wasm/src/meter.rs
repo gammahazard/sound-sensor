@@ -23,6 +23,7 @@ pub fn MeterScreen(
     db:            ReadSignal<f32>,
     armed:         ReadSignal<bool>,
     tripwire:      ReadSignal<f32>,
+    ducking:       ReadSignal<bool>,
     events:        ReadSignal<Vec<EventEntry>>,
     on_arm_toggle: impl Fn() + 'static,
 ) -> impl IntoView {
@@ -56,7 +57,18 @@ pub fn MeterScreen(
     view! {
         <div style="padding:16px;display:flex;flex-direction:column;gap:16px">
 
-            // ── dB readout ────────────────────────────────────────────────────
+            // ── Ducking banner ──────────────────────────────────────────────
+            {move || ducking.get().then(|| view! {
+                <div style="background:#92400e;border-radius:16px;padding:14px;\
+                            display:flex;flex-direction:column;gap:4px">
+                    <div style="font-weight:700;color:#fef3c7">"Volume Ducked"</div>
+                    <div style="font-size:12px;color:#fde68a">
+                        "Guardian detected sustained loud noise and reduced TV volume."
+                    </div>
+                </div>
+            })}
+
+            // ── dB readout ──────────────────────────────────────────────────
             <div style="text-align:center;margin-top:16px">
                 <div style=move || format!(
                     "font-size:72px;font-weight:900;font-variant-numeric:tabular-nums;\
@@ -70,7 +82,7 @@ pub fn MeterScreen(
                 <div style="color:#94a3b8;font-size:13px;margin-top:4px">"dBFS"</div>
             </div>
 
-            // ── Bar meter ─────────────────────────────────────────────────────
+            // ── Bar meter ───────────────────────────────────────────────────
             <div style="position:relative;height:40px;background:#1e293b;\
                         border-radius:999px;overflow:hidden;margin:0 8px">
                 <div style=move || format!(
@@ -95,15 +107,21 @@ pub fn MeterScreen(
                 <span>"0 dB"</span>
             </div>
 
-            // ── Status row ────────────────────────────────────────────────────
+            // ── Status row ──────────────────────────────────────────────────
             <div style="display:flex;justify-content:space-between;\
                         background:#1e293b;border-radius:16px;padding:16px">
                 <StatusCell label="Status">
                     <span style=move || format!(
                         "font-weight:600;color:{}",
-                        if armed.get() { "#22c55e" } else { "#94a3b8" }
+                        if ducking.get() { "#f59e0b" }
+                        else if armed.get() { "#22c55e" }
+                        else { "#94a3b8" }
                     )>
-                        {move || if armed.get() { "Armed" } else { "Disarmed" }}
+                        {move || {
+                            if ducking.get() { "Ducking" }
+                            else if armed.get() { "Armed" }
+                            else { "Disarmed" }
+                        }}
                     </span>
                 </StatusCell>
                 <StatusCell label="Tripwire">
@@ -122,7 +140,7 @@ pub fn MeterScreen(
                 </StatusCell>
             </div>
 
-            // ── Arm / Disarm button ───────────────────────────────────────────
+            // ── Arm / Disarm button ─────────────────────────────────────────
             <button
                 on:click=move |_| on_arm_toggle.get_value()()
                 style=move || format!(
@@ -135,7 +153,7 @@ pub fn MeterScreen(
                 {move || if armed.get() { "Disarm Guardian" } else { "Arm Guardian" }}
             </button>
 
-            // ── Recent events ─────────────────────────────────────────────────
+            // ── Recent events ───────────────────────────────────────────────
             {move || {
                 let evts = events.get();
                 if evts.is_empty() { return ().into_view(); }
@@ -162,7 +180,7 @@ pub fn MeterScreen(
     }
 }
 
-// ── Helper: status cell ───────────────────────────────────────────────────────
+// ── Helper: status cell ─────────────────────────────────────────────────────
 
 #[component]
 fn StatusCell(label: &'static str, children: Children) -> impl IntoView {

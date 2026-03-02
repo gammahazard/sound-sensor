@@ -68,35 +68,39 @@ sound-sensor/
 ├── phase0_micropython/
 │   └── test_i2s.py         Phase 0: hardware verification (MicroPython)
 │
-├── firmware-rs/             Phase 2: Rust + Embassy firmware  ← ACTIVE
+├── firmware-rs/             Rust + Embassy firmware (v0.3.0)
 │   ├── Cargo.toml           embassy-rp (RP2350), embassy-net, cyw43
 │   ├── memory.x
 │   └── src/
-│       ├── main.rs          Entry point, task spawning, static cells
-│       ├── audio.rs         PIO I²S + RMS → dBFS, pushes to DB_CHANNEL
-│       ├── ducking.rs       Adaptive ducking state machine
-│       ├── net.rs           CYW43 WiFi bring-up, spawns http/ws/tv tasks
-│       ├── ws.rs            WebSocket server (port 81), Embassy select loop
-│       ├── tv.rs            LG / Samsung / Sony / Roku volume control
-│       ├── http.rs          HTTP server (port 80), serves WASM PWA
+│       ├── main.rs          Entry point, channels, LED patterns, enums
+│       ├── audio.rs         PIO I²S + RMS → dBFS (pio_proc asm)
+│       ├── ducking.rs       Adaptive ducking state machine + validation
+│       ├── net.rs           WiFi bring-up, flash creds, LED loop, WiFi commands
+│       ├── ws.rs            WebSocket server (port 81), 10 commands, events
+│       ├── tv.rs            LG / Samsung / Sony / Roku + SSDP discovery
+│       ├── http.rs          HTTP server (port 80), serves PWA + OTA endpoint
+│       ├── flash_fs.rs      Append-only flash file store (0x100000–0x1FF000)
+│       ├── ota.rs           OTA version check scaffold
 │       └── pwa_assets.rs    include_bytes! from pwa-wasm/dist/
 │
-└── pwa-wasm/                Phase 2: Leptos + WASM PWA  ← ACTIVE
-    ├── Cargo.toml           leptos 0.7 csr, gloo-net, futures, web-sys
-    ├── Trunk.toml           builds to dist/ with fixed filenames (data-no-hash)
-    ├── index.html
-    ├── sw.js                Service worker — enables "Add to Home Screen"
-    ├── manifest.json
-    ├── icon-192.png
-    ├── icon-512.png
-    └── src/
-        ├── main.rs          App root, 5 tabs, localStorage, event log
-        ├── ws.rs            WebSocket client, drives all reactive signals
-        ├── meter.rs         Live dB bar, peak hold, arm/disarm
-        ├── calibration.rs   Two-step calibration + manual slider
-        ├── tv.rs            Brand selection, IP/PSK entry, connect/disconnect
-        ├── wifi.rs          WiFi network switching
-        └── info.rs          Versions, WS state, full event log
+├── pwa-wasm/                Leptos + WASM PWA (v0.1.0)
+│   ├── Cargo.toml           leptos 0.7 csr, gloo-net, futures, web-sys
+│   ├── Trunk.toml           builds to dist/ with fixed filenames (data-no-hash)
+│   ├── index.html
+│   ├── sw.js                Service worker — enables "Add to Home Screen"
+│   ├── manifest.json
+│   ├── icon-192.png
+│   ├── icon-512.png
+│   └── src/
+│       ├── main.rs          App root, 5 tabs, signals, event log
+│       ├── ws.rs            WebSocket client, events, OtaStatus, NetworkInfo
+│       ├── meter.rs         Live dB bar, ducking banner, peak hold, arm/disarm
+│       ├── calibration.rs   Two-step calibration + placement reminder
+│       ├── tv.rs            Brand selection, SSDP discover, IP entry, connect
+│       ├── wifi.rs          WiFi scan, network list, credentials form
+│       └── info.rs          Versions, OTA check button, full event log
+│
+└── mock_ws.py               Mock firmware WS server for UI testing
 ```
 
 ---
@@ -134,7 +138,7 @@ Before doing anything else, verify the mic works with MicroPython.
 
 ---
 
-## Phase 2 — Rust + Embassy Firmware + Leptos PWA
+## Building — Rust + Embassy Firmware + Leptos PWA
 
 ### Download CYW43 firmware blobs
 
@@ -165,9 +169,21 @@ GUARDIAN_SSID="YourWiFiName" GUARDIAN_PASS="YourPassword" cargo run --release
 The firmware `include_bytes!`s the files from `pwa-wasm/dist/` at compile time.
 If you skip step 1, the firmware build will fail with "no such file" errors.
 
+### Environment variables (all optional)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GUARDIAN_SSID` | `MyHomeNetwork` | WiFi SSID (compile-time fallback) |
+| `GUARDIAN_PASS` | `password` | WiFi password (compile-time fallback) |
+| `GUARDIAN_TV_IP` | (empty) | Default TV IP |
+| `GUARDIAN_GH_OWNER` | `gammahazard` | GitHub owner for OTA checks |
+| `GUARDIAN_GH_REPO` | `sound-sensor` | GitHub repo for OTA checks |
+
+WiFi credentials saved in-app (via the WiFi tab) are persisted to flash and take priority over compile-time values.
+
 ### First boot
 
-1. Pico connects to your WiFi network
+1. Pico connects to your WiFi network (LED blinks fast during connect)
 2. Open `http://guardian.local` in Safari (or the device IP if mDNS doesn't work)
 3. Tap Share → **Add to Home Screen** → opens full-screen, no browser chrome
 
@@ -177,28 +193,55 @@ If you skip step 1, the firmware build will fail with "no such file" errors.
 
 | Tab | What it does |
 |---|---|
-| **Meter** | Live dBFS bar, tripwire marker, peak hold, arm/disarm button, recent events |
-| **Calibrate** | Step 1: record silence, Step 2: record TV max → auto-sets tripwire 3 dB below |
-| **TV** | Select brand, enter IP, connect → Pico controls volume via WiFi |
-| **WiFi** | Switch the Pico to a different WiFi network |
-| **Info** | Firmware/PWA versions, WebSocket state, full event log |
+| **Meter** | Live dBFS bar, tripwire marker, peak hold, ducking banner, arm/disarm, recent events |
+| **Calibrate** | Placement reminder, Step 1: record silence, Step 2: record TV max, manual slider |
+| **TV** | SSDP auto-discover, brand selection, IP entry, Sony PSK, connect/disconnect |
+| **WiFi** | Scan networks, signal strength bars, tap to autofill, change credentials |
+| **Info** | Firmware/PWA versions, WebSocket state, OTA check button, full event log |
 
 ---
 
 ## TV Support
 
-| Brand | How it works | Pairing |
-|---|---|---|
-| **LG WebOS** | WebSocket SSAP on port 3000, absolute `setVolume` | TV shows popup on first connect |
-| **Samsung** | WebSocket Smart Remote on port 8001, key presses | TV shows popup, saves token for session |
-| **Sony Bravia** | HTTP JSON-RPC on port 80, absolute `setAudioVolume` | Set a PIN in TV Settings → IP Control |
-| **Roku** | ECP HTTP on port 8060, key presses | No pairing needed |
+| Brand | How it works | Pairing | Volume Restore |
+|---|---|---|---|
+| **LG WebOS** | WebSocket SSAP on port 3000 | TV popup on first connect | Absolute (setVolume) |
+| **Samsung** | WebSocket Smart Remote on port 8001 | TV popup, token saved to flash | Relative (N × VolumeUp) |
+| **Sony Bravia** | HTTP JSON-RPC on port 80 | Set a PIN in TV Settings → IP Control | Absolute (setAudioVolume) |
+| **Roku** | ECP HTTP on port 8060 | No pairing needed | Relative (N × VolumeUp) |
 
-**LG and Sony** support absolute volume restore (snaps back to original level).
-**Samsung and Roku** restore by replaying N × VolumeUp key presses.
+**LG and Sony** restore to exact original volume.
+**Samsung and Roku** restore by replaying the same number of VolumeUp presses.
+
+Samsung pairing tokens are persisted to flash — the TV popup only appears once.
 
 For Sony, you must first enable IP Control:
 > TV Settings → Network → Home Network Setup → IP Control → Simple IP Control: **On** → set a Pre-Shared Key PIN
+
+---
+
+## LED Status (CYW43 GPIO_0 on Pico W/2W)
+
+| Pattern | Meaning |
+|---|---|
+| Fast blink (200ms) | Connecting to WiFi |
+| Slow pulse (100ms on / 2s off) | Idle — connected, not armed |
+| Double-flash every 3s | Armed — listening |
+| Solid on | Ducking — TV volume reduced |
+| 3 rapid blinks | Error (WiFi failed) |
+
+---
+
+## Flash Storage
+
+| Region | Size | Purpose |
+|---|---|---|
+| 0x000000–0x0FFFFF | 1 MB | Firmware binary |
+| 0x100000–0x1FEFFF | ~1 MB | Flash FS (OTA PWA assets) |
+| 0x1FF000–0x1FFFFF | 4 KB | Config block (WiFi creds + TV config + CRC32) |
+| 0x200000–0x3FFFFF | 2 MB | Reserved |
+
+The config block stores WiFi SSID/password and TV settings (IP, brand, Samsung token, Sony PSK). All fields are CRC32-protected and survive reboots.
 
 ---
 
@@ -218,59 +261,70 @@ The 3-second rule: ducking only fires if noise stays above the tripwire for 3 su
 
 You can run the UI locally from your laptop before the Pico arrives.
 
-### Step 1 — Run the dev server
+### Step 1 — Run the mock firmware
+
+```bash
+pip install websockets
+python3 mock_ws.py
+# Listens on ws://localhost:81
+```
+
+The mock server simulates all firmware features:
+- Sends telemetry 10x/sec with a sine-wave dB meter
+- Responds to arm/disarm, calibration, threshold commands
+- Returns mock WiFi scan results (4 networks)
+- Returns mock SSDP TV discovery (3 TVs)
+- Returns OTA check status
+- Simulates ducking state when armed
+
+### Step 2 — Run the PWA dev server
 
 ```bash
 cd pwa-wasm
 trunk serve
 # Opens at http://localhost:8080
-# Will show "Connecting to Guardian…" banner (no firmware yet)
 ```
 
-### Step 2 — Optional: mock firmware with a Python WebSocket server
-
-```bash
-pip install websockets
-```
-
-```python
-# mock_ws.py — paste and run: python3 mock_ws.py
-import asyncio, websockets, json, math
-
-async def handler(ws):
-    t = 0
-    async for _ in ws:  # absorb any commands sent by the PWA
-        pass
-
-async def broadcast(ws):
-    t = 0
-    while True:
-        db = -35.0 + 15.0 * math.sin(t * 0.05)   # sine-wave meter for testing
-        msg = json.dumps({
-            "db":       round(db, 2),
-            "armed":    False,
-            "tripwire": -20.0,
-            "fw":       "0.2.0",
-            "pwa":      "0.1.0",
-        })
-        try:
-            await ws.send(msg)
-        except Exception:
-            break
-        await asyncio.sleep(0.1)
-        t += 1
-
-async def serve(ws):
-    await asyncio.gather(broadcast(ws), handler(ws))
-
-asyncio.run(websockets.serve(serve, "localhost", 81).__aenter__().__await__().__next__())
-```
-
-With the mock server running, the meter bar will animate and you can navigate all tabs.
+With both running, the full UI is interactive — you can navigate all tabs,
+arm/disarm, calibrate, discover TVs, scan WiFi, and check for updates.
 
 > **TV control from the laptop**: not possible — the TV commands run on the Pico firmware.
-> If you want to verify your TV responds to volume commands before the Pico arrives,
-> see the TV-specific curl examples in the Troubleshooting section below.
+> To verify your TV responds to volume commands before the Pico arrives,
+> see the curl examples in the Troubleshooting section below.
+
+---
+
+## WebSocket Protocol
+
+### Telemetry (server → client, 10×/sec)
+
+```json
+{"db":-32.5,"armed":false,"tripwire":-20.0,"ducking":false,"fw":"0.3.0","pwa":"0.1.0"}
+```
+
+### Events (server → client)
+
+```json
+{"evt":"wifi_scan","networks":[{"ssid":"Home","rssi":-45},...]}
+{"evt":"discovered","tvs":[{"ip":"192.168.1.100","name":"LG TV","brand":"lg"},...]}
+{"evt":"ota_status","checking":false,"available":false,"current":"0.1.0","latest":"0.1.0","fw":"0.3.0"}
+{"evt":"wifi_reconfiguring","ssid":"NewNetwork"}
+```
+
+### Commands (client → server)
+
+| Command | JSON |
+|---|---|
+| Arm | `{"cmd":"arm"}` |
+| Disarm | `{"cmd":"disarm"}` |
+| Calibrate silence | `{"cmd":"calibrate_silence","db":-42.0}` |
+| Calibrate max | `{"cmd":"calibrate_max","db":-28.5}` |
+| Manual threshold | `{"threshold":-18.0}` |
+| Set TV | `{"cmd":"set_tv","ip":"192.168.1.5","brand":"lg"}` |
+| Set WiFi | `{"cmd":"set_wifi","ssid":"...","pass":"..."}` |
+| Scan WiFi | `{"cmd":"scan_wifi"}` |
+| Discover TVs | `{"cmd":"discover_tvs"}` |
+| Check OTA | `{"cmd":"ota_check"}` |
 
 ---
 
@@ -281,19 +335,17 @@ With the mock server running, the meter bar will animate and you can navigate al
 | I²S buffer all zeros | LRCL not BCLK+1, or 5V on mic | Check wiring: 3.3V only, LRCL=GP1 |
 | guardian.local not found | mDNS unreliable on some routers | Use device IP from serial monitor |
 | WebSocket won't connect | Phone on different subnet | Ensure phone and Pico are on same WiFi |
+| LED blinks 3× then stops | WiFi credentials wrong | Check GUARDIAN_SSID/PASS or re-enter via WiFi tab |
 | TV not pairing | IP wrong or TV asleep | Wake TV, verify IP in router DHCP table |
 | Sony volume not changing | PSK mismatch | Re-enter PIN from TV Settings → IP Control |
-| Samsung popup doesn't appear | Port 8001 blocked or newer model | Some 2021+ Samsung use port 8002 (TLS — Phase 3) |
+| Samsung popup every reboot | Token not persisting | Ensure flash write succeeds (check RTT logs) |
+| Samsung popup doesn't appear | Port 8001 blocked or newer model | Some 2021+ Samsung use port 8002 (TLS — future) |
 | trunk build fails | Leptos API mismatch | Run `rustup update` then rebuild |
 | cargo build fails with "no such file" | pwa-wasm/dist/ missing | Run `trunk build --release` in pwa-wasm/ first |
+| Ducking fires too easily | Tripwire too low | Recalibrate or raise manual threshold |
+| Ducking never fires | Tripwire too high or not armed | Check Meter tab → ensure Armed + tripwire is reasonable |
 
 ### Manually test TV APIs (before Pico arrives)
-
-**LG WebOS** — find IP in TV Settings → All Settings → Network → Wired/Wireless Connection:
-```bash
-# LG uses WebSocket on port 3000 — hard to curl, use a WS client
-# Or just trust the firmware; LG pairing is reliable
-```
 
 **Sony Bravia** — enable IP Control first, then:
 ```bash
@@ -321,20 +373,34 @@ curl -X POST http://192.168.1.X:8060/keypress/VolumeUp
 ## Verification Checklist
 
 - [ ] Phase 0: non-zero I²S values in MicroPython REPL when clapping
-- [ ] Phase 2: meter animates in Safari when tapping near mic
-- [ ] Phase 2: app installs full-screen from Home Screen (no browser chrome)
-- [ ] Phase 2: WebSocket auto-reconnects after WiFi drop
-- [ ] Phase 2: calibration persists after closing and reopening app
-- [ ] Phase 2: 4-second clap → ducking fires; 1-second clap → no ducking
-- [ ] Phase 2: TV tab → connect → TV volume drops on sustained noise
+- [ ] Meter animates in Safari when tapping near mic
+- [ ] App installs full-screen from Home Screen (no browser chrome)
+- [ ] WebSocket auto-reconnects after WiFi drop
+- [ ] Calibration persists after closing and reopening app
+- [ ] 4-second clap → ducking fires; 1-second clap → no ducking
+- [ ] TV tab → connect → TV volume drops on sustained noise
+- [ ] TV volume restores when room goes quiet
+- [ ] WiFi tab → scan shows nearby networks
+- [ ] WiFi tab → change network → Pico reboots and reconnects
+- [ ] Samsung pairing token persists across reboots
+- [ ] LED patterns match the table above
+- [ ] Info tab → Check Updates shows "Up to date"
 
 ---
 
-## Phase 3 Roadmap
+## Security
 
-- **OTA updates** — download new PWA from GitHub Releases, write to LittleFS, no reflash
-- **WiFi captive portal** — in-app WiFi switching (firmware receives `set_wifi` command, reboots into AP mode)
-- **Samsung token persistence** — save pairing token to flash so popup only appears once ever
-- **Samsung port 8002** — TLS support for newer 2021+ models
-- **SSDP/mDNS TV discovery** — auto-detect TVs on the network, no manual IP entry
-- **LED status indicator** — blink pattern for armed/ducking state (via CYW43 GPIO_0)
+- **Zero cloud** — all communication is local LAN only
+- **No telemetry** — the device does not contact any external servers (OTA check is opt-in)
+- **No audio recording** — only RMS dB levels leave the microphone; raw audio is never stored or transmitted
+- **Flash credentials** — WiFi passwords and TV tokens stored with CRC32 integrity check
+- **No open ports** — only port 80 (HTTP) and port 81 (WebSocket) on LAN
+- **JSON input sanitization** — firmware uses substring matching, not a JSON parser; malformed input is silently dropped
+
+---
+
+## Roadmap
+
+- **OTA downloads** — full TLS client to download PWA updates from GitHub Releases (requires TRNG wiring)
+- **Samsung port 8002** — TLS support for newer 2021+ Samsung TV models
+- **Pico W port** — production build for the cheaper RP2040 board

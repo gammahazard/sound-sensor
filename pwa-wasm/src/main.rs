@@ -47,7 +47,12 @@ fn local_set(key: &str, val: &str) {
 
 fn now_hhmm() -> String {
     let d = js_sys::Date::new_0();
-    format!("{:02}:{:02}", d.get_hours(), d.get_minutes())
+    format!("{:02}:{:02}:{:02}", d.get_hours(), d.get_minutes(), d.get_seconds())
+}
+
+/// Escape a string for safe JSON embedding (handles quotes and backslashes).
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 // ── App root ──────────────────────────────────────────────────────────────────
@@ -58,6 +63,7 @@ fn App() -> impl IntoView {
     let (db, set_db)               = create_signal(-60.0f32);
     let (armed, set_armed)         = create_signal(false);
     let (tripwire, set_tripwire)   = create_signal(-20.0f32);
+    let (ducking, set_ducking)     = create_signal(false);
     let (ws_state, set_ws_state)   = create_signal(ws::WsState::Connecting);
     let (active_tab, set_tab)      = create_signal("meter");
     let (fw_ver, set_fw_ver)       = create_signal(String::new());
@@ -65,13 +71,21 @@ fn App() -> impl IntoView {
     let (msg_count, set_msg_count) = create_signal(0u32);
     let (events, set_events)       = create_signal(Vec::<EventEntry>::new());
 
-    // TV settings — initialised from localStorage, persisted on connect/disconnect
+    // TV settings
     let (tv_ip,        set_tv_ip)        = create_signal(local_get("tv_ip",    ""));
     let (tv_brand,     set_tv_brand)     = create_signal(local_get("tv_brand", "lg"));
     let (tv_connected, set_tv_connected) = create_signal(!local_get("tv_ip", "").is_empty());
 
-    // ── add_event: shared event log writer ────────────────────────────────────
-    // StoredValue is Copy, so we can capture it in any number of closures.
+    // WiFi networks from scan
+    let (wifi_networks, set_wifi_networks) = create_signal(Vec::<ws::NetworkInfo>::new());
+
+    // Discovered TVs from SSDP
+    let (discovered_tvs, set_discovered_tvs) = create_signal(Vec::<ws::DiscoveredTv>::new());
+
+    // OTA status
+    let (ota_status, set_ota_status) = create_signal(ws::OtaStatus::Idle);
+
+    // ── add_event ───────────────────────────────────────────────────────────
     let add_event_sv = store_value({
         move |msg: String| {
             let entry = EventEntry { msg, time: now_hhmm() };
@@ -82,22 +96,35 @@ fn App() -> impl IntoView {
         }
     });
 
-    // ── WebSocket ─────────────────────────────────────────────────────────────
+    // ── Ducking state change → auto-generate events ─────────────────────────
+    let prev_ducking = store_value(false);
+    create_effect(move |_| {
+        let d = ducking.get();
+        let prev = prev_ducking.get_value();
+        if d && !prev {
+            add_event_sv.with_value(|f| f("Volume ducked".to_string()));
+        } else if !d && prev {
+            add_event_sv.with_value(|f| f("Volume restored".to_string()));
+        }
+        prev_ducking.set_value(d);
+    });
+
+    // ── WebSocket ───────────────────────────────────────────────────────────
     let send = ws::use_websocket(
         set_db, set_armed, set_tripwire, set_ws_state,
         set_fw_ver, set_pwa_ver, set_msg_count,
+        set_ducking, set_wifi_networks, set_discovered_tvs, set_ota_status,
     );
-    // StoredValue so we can call it from multiple tab closures without moving
     let send_sv = store_value(send);
 
-    // ── View ──────────────────────────────────────────────────────────────────
+    // ── View ────────────────────────────────────────────────────────────────
     view! {
         <div id="app" style="height:100%;display:flex;flex-direction:column;overflow:hidden">
 
-            // ── Connection banner ─────────────────────────────────────────────
+            // ── Connection banner ─────────────────────────────────────────
             <ws::ConnectionBanner state=ws_state />
 
-            // ── Active screen (scrollable) ────────────────────────────────────
+            // ── Active screen (scrollable) ────────────────────────────────
             <div style="flex:1;overflow-y:auto">
                 {move || match active_tab.get() {
 
@@ -106,6 +133,7 @@ fn App() -> impl IntoView {
                             db=db
                             armed=armed
                             tripwire=tripwire
+                            ducking=ducking
                             events=events
                             on_arm_toggle=move || {
                                 let next = !armed.get_untracked();
@@ -158,6 +186,7 @@ fn App() -> impl IntoView {
                             set_tv_ip=set_tv_ip
                             set_tv_brand=set_tv_brand
                             set_tv_connected=set_tv_connected
+                            discovered_tvs=discovered_tvs
                             on_connect=move |ip: String, brand: String, psk: String| {
                                 local_set("tv_ip",    &ip);
                                 local_set("tv_brand", &brand);
@@ -166,10 +195,10 @@ fn App() -> impl IntoView {
                                     f(format!("TV: {} @ {}", brand.to_uppercase(), ip))
                                 });
                                 let mut cmd = format!(
-                                    r#"{{"cmd":"set_tv","ip":"{}","brand":"{}""#, ip, brand
+                                    r#"{{"cmd":"set_tv","ip":"{}","brand":"{}""#, json_escape(&ip), brand
                                 );
                                 if !psk.is_empty() {
-                                    cmd.push_str(&format!(r#","psk":"{}""#, psk));
+                                    cmd.push_str(&format!(r#","psk":"{}""#, json_escape(&psk)));
                                 }
                                 cmd.push('}');
                                 send_sv.get_value()(cmd);
@@ -177,19 +206,31 @@ fn App() -> impl IntoView {
                             on_disconnect=move || {
                                 local_set("tv_ip",  "");
                                 local_set("tv_psk", "");
+                                set_tv_brand("lg".to_string());
+                                set_discovered_tvs(Vec::new());
                                 add_event_sv.with_value(|f| f("TV disconnected".to_string()));
+                                // Send clear command to firmware
+                                send_sv.get_value()(r#"{"cmd":"set_tv","ip":"","brand":"lg"}"#.to_string());
+                            }
+                            on_discover=move || {
+                                send_sv.get_value()(r#"{"cmd":"discover_tvs"}"#.to_string());
                             }
                         />
                     }.into_view(),
 
                     "wifi" => view! {
                         <wifi::WifiScreen
+                            ws_state=ws_state
+                            wifi_networks=wifi_networks
+                            on_scan=move || {
+                                send_sv.get_value()(r#"{"cmd":"scan_wifi"}"#.to_string());
+                            }
                             on_reconfigure=move |ssid: String, pass: String| {
                                 add_event_sv.with_value(|f| {
                                     f(format!("WiFi change → \"{}\"", ssid))
                                 });
                                 send_sv.get_value()(
-                                    format!(r#"{{"cmd":"set_wifi","ssid":"{}","pass":"{}"}}"#, ssid, pass)
+                                    format!(r#"{{"cmd":"set_wifi","ssid":"{}","pass":"{}"}}"#, json_escape(&ssid), json_escape(&pass))
                                 );
                             }
                         />
@@ -202,19 +243,34 @@ fn App() -> impl IntoView {
                             pwa_ver=pwa_ver
                             msg_count=msg_count
                             events=events
+                            ota_status=ota_status
+                            on_ota_check=move || {
+                                set_ota_status(ws::OtaStatus::Checking);
+                                send_sv.get_value()(r#"{"cmd":"ota_check"}"#.to_string());
+                                // 15s timeout to reset Checking state
+                                let set_ota = set_ota_status.clone();
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    gloo_timers::future::TimeoutFuture::new(15_000).await;
+                                    set_ota.update(|s| {
+                                        if *s == ws::OtaStatus::Checking {
+                                            *s = ws::OtaStatus::Idle;
+                                        }
+                                    });
+                                });
+                            }
                         />
                     }.into_view(),
                 }}
             </div>
 
-            // ── Bottom navigation bar ─────────────────────────────────────────
+            // ── Bottom navigation bar ─────────────────────────────────────
             <BottomNav active=active_tab on_switch=set_tab />
 
         </div>
     }
 }
 
-// ── Bottom nav ────────────────────────────────────────────────────────────────
+// ── Bottom nav ──────────────────────────────────────────────────────────────
 
 #[component]
 fn BottomNav(
@@ -251,14 +307,13 @@ fn BottomNav(
     }
 }
 
-// ── Entry ─────────────────────────────────────────────────────────────────────
+// ── Entry ───────────────────────────────────────────────────────────────────
 
 #[wasm_bindgen(start)]
 pub fn main() {
     console_error_panic_hook::set_once();
     console_log::init_with_level(log::Level::Debug).ok();
 
-    // Register service worker
     if let Some(window) = web_sys::window() {
         let _ = window.navigator().service_worker().register("sw.js");
     }

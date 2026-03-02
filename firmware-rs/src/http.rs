@@ -1,30 +1,7 @@
 //! http.rs — HTTP/1.1 server on port 80
 //!
-//! Serves the Guardian PWA with a two-layer strategy:
-//!
-//!   Layer 1 (LittleFS) — OTA-updatable files on the flash filesystem.
-//!                         Written by the /api/ota endpoint after a download.
-//!   Layer 2 (Flash)    — `pwa_assets` byte arrays baked into the firmware.
-//!                         Always present; cannot be corrupted by a bad OTA.
-//!
-//! Request routing:
-//!   GET  /                        → index.html  (text/html)
-//!   GET  /index.html              → index.html
-//!   GET  /guardian_pwa.js         → JS glue     (application/javascript)
-//!   GET  /guardian_pwa_bg.wasm    → WASM binary  (application/wasm)
-//!   GET  /sw.js                   → sw.js        (application/javascript)
-//!   GET  /manifest.json           → manifest.json (application/manifest+json)
-//!   GET  /icon-192.png            → icon         (image/png)
-//!   GET  /icon-512.png            → icon         (image/png)
-//!   GET  /version.json            → version.json  (application/json)
-//!   POST /api/ota                 → trigger OTA  (application/json)
-//!   *                             → 404
-//!
-//! OTA flow (POST /api/ota):
-//!   Currently returns the local version only.
-//!   Full implementation requires outbound TLS (embedded-tls / rustls-embedded)
-//!   to reach GitHub Releases — deferred to Phase 3.
-//!   TODO: add embedded-tls, implement download + LittleFS write.
+//! Serves the Guardian PWA. Falls back to pwa_assets (baked into firmware).
+//! POST /api/ota triggers OTA check.
 
 use defmt::*;
 use embassy_net::{Stack, TcpSocket};
@@ -58,7 +35,6 @@ pub async fn http_task(stack: &'static Stack<NetDriver<'static>>) {
 }
 
 async fn handle_request(socket: &mut TcpSocket<'_>) {
-    // Read the HTTP request line (we only need the first line)
     let mut buf = [0u8; 256];
     let len = match read_until_double_crlf(socket, &mut buf).await {
         Some(n) => n,
@@ -71,7 +47,6 @@ async fn handle_request(socket: &mut TcpSocket<'_>) {
     let request = core::str::from_utf8(&buf[..len]).unwrap_or("");
     let first_line = request.lines().next().unwrap_or("");
 
-    // Parse method and path from "GET /path HTTP/1.1"
     let mut parts = first_line.splitn(3, ' ');
     let method = parts.next().unwrap_or("");
     let path   = parts.next().unwrap_or("/");
@@ -101,8 +76,15 @@ async fn handle_request(socket: &mut TcpSocket<'_>) {
             serve_asset(socket, assets::ICON_512, "image/png").await;
         }
         ("GET",  "/version.json") => {
-            // TODO: check LittleFS for a newer version.json first
-            serve_asset(socket, assets::VERSION_JSON, "application/json").await;
+            // Build version.json dynamically
+            let mut body: heapless::String<128> = heapless::String::new();
+            let _ = core::write!(
+                body,
+                r#"{{"fw":"{}","pwa":"{}"}}"#,
+                crate::FW_VERSION,
+                crate::PWA_VERSION,
+            );
+            serve_dynamic(socket, body.as_bytes(), "application/json").await;
         }
         ("POST", "/api/ota") => {
             handle_ota(socket).await;
@@ -113,10 +95,9 @@ async fn handle_request(socket: &mut TcpSocket<'_>) {
     }
 }
 
-// ── Asset serving ─────────────────────────────────────────────────────────────
+// ── Asset serving ───────────────────────────────────────────────────────────
 
 async fn serve_asset(socket: &mut TcpSocket<'_>, body: &[u8], content_type: &str) {
-    // Send headers
     let mut headers: heapless::String<256> = heapless::String::new();
     let _ = core::write!(
         headers,
@@ -130,20 +111,34 @@ async fn serve_asset(socket: &mut TcpSocket<'_>, body: &[u8], content_type: &str
         body.len(),
     );
 
-    if socket.write_all(headers.as_bytes()).await.is_err() {
-        return;
-    }
+    if socket.write_all(headers.as_bytes()).await.is_err() { return; }
 
-    // Send body in chunks (TX buffer is 2048 bytes; body can be larger)
     let mut pos = 0;
     while pos < body.len() {
         let end = (pos + 1024).min(body.len());
-        if socket.write_all(&body[pos..end]).await.is_err() {
-            return;
-        }
+        if socket.write_all(&body[pos..end]).await.is_err() { return; }
         pos = end;
     }
 
+    let _ = socket.flush().await;
+}
+
+async fn serve_dynamic(socket: &mut TcpSocket<'_>, body: &[u8], content_type: &str) {
+    let mut headers: heapless::String<256> = heapless::String::new();
+    let _ = core::write!(
+        headers,
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: close\r\n\
+         \r\n",
+        content_type,
+        body.len(),
+    );
+
+    if socket.write_all(headers.as_bytes()).await.is_err() { return; }
+    let _ = socket.write_all(body).await;
     let _ = socket.flush().await;
 }
 
@@ -157,30 +152,19 @@ async fn send_error(socket: &mut TcpSocket<'_>, code: u16, msg: &str) {
     let _ = socket.write_all(resp.as_bytes()).await;
 }
 
-// ── OTA endpoint ──────────────────────────────────────────────────────────────
+// ── OTA endpoint ────────────────────────────────────────────────────────────
 
 async fn handle_ota(socket: &mut TcpSocket<'_>) {
-    // Return current version info.
-    //
-    // TODO (Phase 3): make an outbound HTTPS GET to GitHub Releases to fetch
-    // the latest version.json, compare with crate::PWA_VERSION, and if newer:
-    //   1. Download pwa.tar.gz
-    //   2. Mount LittleFS on the 1.6MB flash partition
-    //   3. Extract and write each file to LittleFS
-    //   4. Write version.json to LittleFS
-    //   5. Return {"status":"updated","pwa":"<new_version>"}
-    //
-    // Requires: embedded-tls (or rustls-embedded) + littlefs2 crates.
-
-    let mut body: heapless::String<128> = heapless::String::new();
-    let _ = core::write!(
-        body,
-        r#"{{"status":"ok","fw":"{}","pwa":"{}"}}"#,
-        crate::FW_VERSION,
-        crate::PWA_VERSION,
+    let result = crate::ota::check_for_update().await;
+    let json = crate::ota::status_json(
+        false,
+        result.available,
+        result.current.as_str(),
+        result.latest.as_str(),
+        false,
     );
 
-    let mut resp: heapless::String<256> = heapless::String::new();
+    let mut resp: heapless::String<512> = heapless::String::new();
     let _ = core::write!(
         resp,
         "HTTP/1.1 200 OK\r\n\
@@ -188,19 +172,17 @@ async fn handle_ota(socket: &mut TcpSocket<'_>) {
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n",
-        body.len(),
+        json.len(),
     );
 
     if socket.write_all(resp.as_bytes()).await.is_ok() {
-        let _ = socket.write_all(body.as_bytes()).await;
+        let _ = socket.write_all(json.as_bytes()).await;
     }
     let _ = socket.flush().await;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Read from the socket until the \r\n\r\n header terminator is seen,
-/// or the buffer fills. Returns the number of bytes read.
 async fn read_until_double_crlf(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Option<usize> {
     let mut len = 0;
     loop {
@@ -212,7 +194,6 @@ async fn read_until_double_crlf(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> O
                     return Some(len);
                 }
                 if len >= buf.len() {
-                    // Buffer full — return what we have (headers truncated but first line ok)
                     return Some(len);
                 }
             }
