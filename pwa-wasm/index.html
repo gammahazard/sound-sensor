@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Guardian">
+  <meta name="theme-color" content="#0f172a">
+
+  <title>Guardian</title>
+
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icon-192.png">
+
+  <!-- data-no-hash: Trunk outputs guardian_pwa.js + guardian_pwa_bg.wasm with fixed names
+       so firmware-rs/pwa_assets.rs can include_bytes! them at known paths. -->
+  <link data-trunk rel="rust" data-wasm-opt="z" data-no-hash/>
+  <link data-trunk rel="copy-file" href="manifest.json"/>
+  <link data-trunk rel="copy-file" href="icon-192.png"/>
+  <link data-trunk rel="copy-file" href="icon-512.png"/>
+  <link data-trunk rel="copy-file" href="sw.js"/>
+
+  <style>
+    :root {
+      --bg:       #0f172a;
+      --surface:  #1e293b;
+      --border:   #334155;
+      --primary:  #6366f1;
+      --danger:   #ef4444;
+      --success:  #22c55e;
+      --warning:  #eab308;
+      --text:     #f1f5f9;
+      --muted:    #94a3b8;
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bot: env(safe-area-inset-bottom, 0px);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    body { padding-top: var(--safe-top); }
+    #app { height: 100%; display: flex; flex-direction: column; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+</body>
+</html>

@@ -1,0 +1,17 @@
+[build]
+# RP2350 uses Cortex-M33 (Thumb2)
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+# probe-rs for flashing (install: cargo install probe-rs-tools)
+runner = "probe-rs run --chip RP2350A"
+
+rustflags = [
+    "-C", "linker=flip-link",          # stack overflow protection
+    "-C", "link-arg=--nmagic",
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=-Tdefmt.x",
+]
+
+[env]
+DEFMT_LOG = "debug"

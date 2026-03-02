@@ -1,0 +1,70 @@
+[package]
+name    = "guardian"
+version = "0.2.0"
+edition = "2021"
+authors = ["Guardian Project"]
+
+[[bin]]
+name  = "guardian"
+path  = "src/main.rs"
+test  = false
+bench = false
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+[dependencies]
+# Embassy core
+embassy-executor   = { version = "0.7",  features = ["arch-cortex-m", "executor-thread", "nightly"] }
+embassy-time       = { version = "0.4",  features = ["defmt"] }
+embassy-sync       = { version = "0.6" }
+embassy-futures    = { version = "0.1" }
+
+# RP2350 HAL (Pico 2 W)
+embassy-rp = {
+    version  = "0.3",
+    features = [
+        "rp2350",
+        "time-driver-timer0",
+        "unstable-pac",
+        "rom-v2-intrinsics",
+    ]
+}
+
+# Networking (lwIP wrapper)
+embassy-net = {
+    version  = "0.6",
+    features = ["tcp", "udp", "dns", "dhcpv4", "medium-ethernet"]
+}
+
+# CYW43 WiFi chip driver (on-chip WiFi for Pico W/Pico 2 W)
+cyw43     = { version = "0.3", features = ["defmt"] }
+cyw43-pio = { version = "0.3", features = ["defmt"] }
+
+# Embedded standard library shims
+embedded-hal      = "1.0"
+embedded-hal-async= "1.0"
+embedded-io-async = "0.6"
+
+# Logging
+defmt       = "0.3"
+defmt-rtt   = "0.4"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+
+# Utilities
+heapless        = "0.8"
+static-cell     = "2"
+portable-atomic = { version = "1", features = ["critical-section"] }
+
+# Math (used in audio.rs for log10/sqrt in no_std)
+libm = "0.2"
+
+# ── Build profile ─────────────────────────────────────────────────────────────
+[profile.release]
+opt-level       = "z"      # optimise for size
+lto             = true
+codegen-units   = 1
+debug           = 2        # keep debug info for defmt
+overflow-checks = false
+
+[profile.dev]
+opt-level = 1
+debug     = 2

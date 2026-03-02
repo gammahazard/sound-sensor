@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:www.raspberrypi.com)",
+      "WebFetch(domain:docs.embassy.dev)",
+      "Bash(python3:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:developer.roku.com)",
+      "WebFetch(domain:pro-bravia.sony.net)",
+      "WebFetch(domain:pyatv.dev)",
+      "WebFetch(domain:forum.logicmachine.net)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:wdesimini.github.io)",
+      "WebFetch(domain:jointspace.sourceforge.net)",
+      "WebFetch(domain:community.roku.com)",
+      "WebFetch(domain:philipstv.readthedocs.io)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:androidtv.readthedocs.io)",
+      "Bash(rustc:*)"
+    ]
+  }
+}

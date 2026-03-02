@@ -1,0 +1,140 @@
+//! wifi.rs — WiFi settings screen (Leptos)
+//!
+//! Shows current connection info and lets the user enter new WiFi credentials.
+//! Sends {"cmd":"set_wifi","ssid":"...","pass":"..."} to the firmware.
+//! Full captive-portal switching is a Phase 3 firmware feature; the UI exists now.
+
+use leptos::*;
+use wasm_bindgen::JsCast;
+
+// ── WiFi screen ───────────────────────────────────────────────────────────────
+
+#[component]
+pub fn WifiScreen(
+    on_reconfigure: impl Fn(String, String) + 'static,  // (ssid, pass)
+) -> impl IntoView {
+    let on_reconfigure = store_value(on_reconfigure);
+
+    let current_host = web_sys::window()
+        .and_then(|w| w.location().hostname().ok())
+        .unwrap_or_else(|| "guardian.local".to_string());
+
+    let (result_msg, set_result)    = create_signal(String::new());
+    let (result_ok,  set_result_ok) = create_signal(false);
+
+    view! {
+        <div style="padding:16px;display:flex;flex-direction:column;gap:16px">
+
+            <div style="text-align:center;margin-top:8px">
+                <div style="font-size:22px;font-weight:700">"WiFi Settings"</div>
+                <div style="color:#94a3b8;font-size:13px;margin-top:4px">
+                    "Manage the Guardian device's WiFi connection."
+                </div>
+            </div>
+
+            // ── Current connection ────────────────────────────────────────────
+            <div style="background:#1e293b;border-radius:16px;padding:16px;display:flex;\
+                        flex-direction:column;gap:10px">
+                <div style="font-weight:700;margin-bottom:2px">"Current Connection"</div>
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="font-size:13px;color:#94a3b8">"Device host"</span>
+                    <span style="font-size:13px;font-weight:600;color:#6366f1">
+                        {current_host.clone()}
+                    </span>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="font-size:13px;color:#94a3b8">"Status"</span>
+                    <span style="font-size:13px;font-weight:600;color:#22c55e">"Connected"</span>
+                </div>
+            </div>
+
+            // ── Change network ────────────────────────────────────────────────
+            <div style="background:#1e293b;border-radius:16px;padding:16px;display:flex;\
+                        flex-direction:column;gap:14px">
+                <div>
+                    <div style="font-weight:700;margin-bottom:4px">"Change WiFi Network"</div>
+                    <div style="font-size:12px;color:#94a3b8">
+                        "Enter the new network credentials. Guardian will reconnect automatically."
+                    </div>
+                </div>
+
+                <div style="display:flex;flex-direction:column;gap:6px">
+                    <label style="font-size:12px;color:#94a3b8">"Network Name (SSID)"</label>
+                    <input
+                        id="wifi-ssid"
+                        type="text"
+                        placeholder="MyHomeNetwork"
+                        autocomplete="off"
+                        style="background:#0f172a;border:1px solid #334155;border-radius:10px;\
+                               padding:10px 12px;color:#f1f5f9;font-size:15px;width:100%"
+                    />
+                </div>
+
+                <div style="display:flex;flex-direction:column;gap:6px">
+                    <label style="font-size:12px;color:#94a3b8">"Password"</label>
+                    <input
+                        id="wifi-pass"
+                        type="password"
+                        placeholder="WiFi password"
+                        autocomplete="current-password"
+                        style="background:#0f172a;border:1px solid #334155;border-radius:10px;\
+                               padding:10px 12px;color:#f1f5f9;font-size:15px;width:100%"
+                    />
+                </div>
+
+                {move || (!result_msg.get().is_empty()).then(|| view! {
+                    <div style=move || format!(
+                        "border-radius:10px;padding:10px;font-size:13px;font-weight:500;\
+                         background:{};color:{}",
+                        if result_ok.get() { "#14532d" } else { "#450a0a" },
+                        if result_ok.get() { "#86efac" } else { "#fca5a5" },
+                    )>
+                        {move || result_msg.get()}
+                    </div>
+                })}
+
+                <button
+                    on:click=move |_| {
+                        let ssid = get_input_value("wifi-ssid");
+                        let pass = get_input_value("wifi-pass");
+                        if ssid.is_empty() {
+                            set_result("Enter the network name (SSID)".to_string());
+                            set_result_ok(false);
+                            return;
+                        }
+                        set_result(
+                            format!("Reconnecting to \"{}\"… Guardian may be unreachable briefly.", ssid)
+                        );
+                        set_result_ok(true);
+                        on_reconfigure.get_value()(ssid, pass);
+                    }
+                    style="width:100%;padding:14px;border-radius:12px;border:none;\
+                           background:#6366f1;color:white;font-size:16px;\
+                           font-weight:700;cursor:pointer"
+                >
+                    "Reconnect"
+                </button>
+            </div>
+
+            // ── Note ──────────────────────────────────────────────────────────
+            <div style="background:#1e293b;border-radius:16px;padding:12px;\
+                        font-size:12px;color:#94a3b8">
+                <strong style="color:#f1f5f9">"Note: "</strong>
+                "After reconnecting, Guardian will drop from this network. "
+                "Open the app again once Guardian joins the new network."
+            </div>
+
+        </div>
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn get_input_value(id: &str) -> String {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+        .map(|el| el.value().trim().to_string())
+        .unwrap_or_default()
+}
