@@ -36,7 +36,7 @@ pub fn ws_text_frame(payload: &[u8], out: &mut [u8]) -> usize {
 }
 
 /// Encode a WebSocket text frame (client→server style, unmasked). Same as ws_text_frame.
-pub fn ws_frame_unmasked(payload: &[u8], out: &mut [u8]) -> usize {
+pub fn ws_frame_masked(payload: &[u8], out: &mut [u8]) -> usize {
     ws_text_frame(payload, out)
 }
 

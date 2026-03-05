@@ -30,7 +30,7 @@ pub struct EventEntry {
 
 // ── localStorage helpers ──────────────────────────────────────────────────────
 
-fn local_get(key: &str, default: &str) -> String {
+pub(crate) fn local_get(key: &str, default: &str) -> String {
     web_sys::window()
         .and_then(|w| w.local_storage().ok())
         .flatten()
@@ -39,7 +39,7 @@ fn local_get(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-fn local_set(key: &str, val: &str) {
+pub(crate) fn local_set(key: &str, val: &str) {
     if let Some(s) = web_sys::window()
         .and_then(|w| w.local_storage().ok())
         .flatten()
@@ -53,9 +53,27 @@ fn now_hhmmss() -> String {
     format!("{:02}:{:02}:{:02}", d.get_hours(), d.get_minutes(), d.get_seconds())
 }
 
-/// Escape a string for safe JSON embedding (handles quotes and backslashes).
+/// Escape a string for safe JSON embedding.
 fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"'  => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                // Control chars → \u00XX
+                let _ = core::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!("\\u{:04x}", c as u32),
+                );
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Trigger a short haptic pulse (Android Chrome). No-ops silently on iOS.
@@ -100,6 +118,22 @@ mod tests {
     #[test]
     fn json_escape_empty() {
         assert_eq!(json_escape(""), "");
+    }
+
+    #[test]
+    fn json_escape_newline() {
+        assert_eq!(json_escape("a\nb"), "a\\nb");
+    }
+
+    #[test]
+    fn json_escape_tab_and_cr() {
+        assert_eq!(json_escape("a\tb\rc"), "a\\tb\\rc");
+    }
+
+    #[test]
+    fn json_escape_control_char() {
+        // \x01 → \u0001
+        assert_eq!(json_escape("x\x01y"), "x\\u0001y");
     }
 }
 
@@ -172,12 +206,12 @@ fn App() -> impl IntoView {
     });
 
     // ── WebSocket ───────────────────────────────────────────────────────────
-    let send = ws::use_websocket(
+    let send = ws::use_websocket(ws::WsSignals {
         set_db, set_armed, set_tripwire, set_ws_state,
         set_fw_ver, set_pwa_ver, set_msg_count,
         set_ducking, set_tv_status, set_wifi_networks, set_discovered_tvs, set_ota_status,
         set_dev_mode, set_dev_logs, set_raw_ws_log, set_reconnect_count, set_last_msg_time,
-    );
+    });
     let send_sv = StoredValue::new_local(send);
 
     // ── View ────────────────────────────────────────────────────────────────

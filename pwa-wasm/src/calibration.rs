@@ -7,22 +7,13 @@
 use leptos::prelude::*;
 
 fn local_get_f32(key: &str, default: f32) -> f32 {
-    web_sys::window()
-        .and_then(|w| w.local_storage().ok())
-        .flatten()
-        .and_then(|s| s.get_item(&format!("guardian_cal_{}", key)).ok())
-        .flatten()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    let k = format!("cal_{}", key);
+    crate::local_get(&k, &default.to_string()).parse().unwrap_or(default)
 }
 
 fn local_set_f32(key: &str, val: f32) {
-    if let Some(storage) = web_sys::window()
-        .and_then(|w| w.local_storage().ok())
-        .flatten()
-    {
-        let _ = storage.set_item(&format!("guardian_cal_{}", key), &val.to_string());
-    }
+    let k = format!("cal_{}", key);
+    crate::local_set(&k, &val.to_string());
 }
 
 // ── Calibration screen ──────────────────────────────────────────────────────

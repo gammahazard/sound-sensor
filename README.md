@@ -49,7 +49,7 @@ SPH0645LM4H ──I²S──►      │                                        
                            (Leptos/WASM PWA)  (CYW43 GPIO_0)
 ```
 
-The Pico 2 W runs five concurrent Embassy tasks in normal (station) mode, or seven in AP setup mode:
+The Pico 2 W runs six concurrent Embassy tasks in normal (station) mode, or eight in AP setup mode:
 
 1. **audio_task** — Captures 24-bit I²S audio from the SPH0645 microphone at 16 kHz using a PIO state machine. Applies an IIR DC blocker per-sample, then every 100ms (1,600 samples) computes the RMS power level in dBFS with EMA smoothing and pushes it into `DB_CHANNEL`.
 
@@ -172,7 +172,7 @@ If a restore fails (TV unreachable, connection dropped), Guardian clears the duc
 
 #### Porting Pico 2 W to Pico W (three edits)
 
-1. `firmware-rs/Cargo.toml` — change `rp2350` to `rp2040`
+1. `firmware-rs/Cargo.toml` — change `rp235xa` to `rp2040`
 2. `firmware-rs/.cargo/config.toml` — change target to `thumbv6m-none-eabi`
 3. `firmware-rs/memory.x` — change RAM length to `264K`
 
@@ -253,12 +253,12 @@ sound-sensor/
 │   │   ├── ws_frame.rs       WebSocket frame encode/decode
 │   │   └── tv_brand.rs       TvBrand enum with parse/to_u8/from_u8
 │   └── tests/
-│       ├── test_ducking.rs    20 tests — state machine, rates, restore paths
-│       ├── test_parsers.rs    26 tests — JSON/string/IP/SSDP parsers
+│       ├── test_ducking.rs    31 tests — state machine, rates, restore paths
+│       ├── test_parsers.rs    38 tests — JSON/string/IP/SSDP parsers
 │       ├── test_crypto.rs     14 tests — SHA-1, Base64, CRC32, WS accept
 │       ├── test_flash_layout.rs 14 tests — roundtrip, interleave, corruption
-│       ├── test_ws_frame.rs   9 tests — encode, decode, roundtrip, unmask
-│       ├── test_audio.rs      6 tests — silence, full-scale, known RMS
+│       ├── test_ws_frame.rs   11 tests — encode, decode, roundtrip, unmask
+│       ├── test_audio.rs      7 tests — silence, full-scale, known RMS
 │       └── test_ota.rs        15 tests — version comparison, tag parse, status JSON
 │
 ├── phase0_micropython/       Hardware verification (MicroPython)
@@ -284,7 +284,7 @@ Tasks communicate through typed, fixed-capacity Embassy channels:
 | `LED_CHANNEL` | `LedPattern` | 4 | any task → wifi_task |
 | `WIFI_CMD_CH` | `WifiCmd` | 4 | ws_task / tv_task → wifi_task |
 | `WIFI_EVT_CH` | `WifiEvent` | 2 | wifi_task → ws_task |
-| `DUCK_CHANNEL` | `DuckCommand` | 4 | ws_task → tv_task |
+| `DUCK_CHANNEL` | `DuckCommand` | 8 | ducking_task → tv_task |
 
 ### Audio Pipeline
 
@@ -359,7 +359,7 @@ On the first PWA load (when `guardian_setup_done` is not set in localStorage), a
 
 The wizard step is tracked in the parent component, so when the user navigates to a tab (e.g., Calibration) and comes back via the "Continue Setup" banner, the wizard resumes at the next step. After completion, the wizard never shows again.
 
-### Five Tabs
+### Six Tabs
 
 **Meter** — The main screen. Shows a real-time dB level bar (updated 10x/sec) with color coding: green (quiet), yellow (moderate), red (loud). A white vertical marker shows the tripwire position. Peak hold displays the highest dB in the last 2 seconds. When ducking is active, an amber banner reads "Volume Ducked". The Arm/Disarm button controls whether Guardian is actively listening. A recent events list shows the last 5 events (ducking started, volume restored, calibration changes, etc.).
 
@@ -370,6 +370,8 @@ The wizard step is tracked in the parent component, so when the user navigates t
 **WiFi** — WiFi network management. "Scan Networks" button triggers a WiFi scan on the Pico. Found networks are listed with signal strength bars (using Unicode block characters). Tap a network to auto-fill the SSID. Password field with "Connect" button. Changing WiFi triggers a firmware reboot. Dynamic status shows the current WebSocket connection state.
 
 **Info** — System information. Shows firmware version, PWA version, WebSocket state, and message count. "Check for Updates" button queries GitHub Releases (with a 15-second timeout that auto-resets). Full scrollable event log showing all events with timestamps.
+
+**Dev** *(conditional)* — Only visible when firmware is built with `--features dev-mode`. Shows a live state dashboard, firmware log stream with 8 category filters, raw WebSocket inspector, calibration debug values, and connection stats. Log forwarding can be paused/resumed at runtime via a toggle button.
 
 ### Reactive Architecture
 
@@ -543,7 +545,8 @@ cargo build --release                     # production (no dev logs)
 cargo build --release --features dev-mode # development (dev logs + Dev tab in PWA)
 
 # 3. Generate UF2 and flash
-elf2uf2-rs target/thumbv8m.main-none-eabihf/release/guardian guardian.uf2
+./mk-uf2.sh              # production UF2 (no dev logs)
+./mk-uf2.sh --dev        # dev UF2 (dev logs + Dev tab in PWA)
 # Hold BOOTSEL on Pico, plug in USB, copy guardian.uf2 to the RPI-RP2 drive
 ```
 
@@ -599,16 +602,16 @@ PWA tests are `#[cfg(test)]` inline modules that compile natively (not to WASM).
 ### Running Tests
 
 ```bash
-# Firmware logic tests (104 tests, runs on host)
+# Firmware logic tests (130+ tests, runs on host)
 cd guardian-test && cargo test
 
 # PWA logic tests (31 tests, runs on host)
 cd pwa-wasm && cargo test --lib --target x86_64-unknown-linux-gnu
 ```
 
-### Test Coverage: guardian-test (104 tests)
+### Test Coverage: guardian-test (130+ tests)
 
-#### Ducking State Machine — 20 tests (`test_ducking.rs`)
+#### Ducking State Machine — 31 tests (`test_ducking.rs`)
 
 | Test | What It Verifies |
 |---|---|
@@ -633,7 +636,7 @@ cd pwa-wasm && cargo test --lib --target x86_64-unknown-linux-gnu
 | `watching_to_quiet_transition` | sustained_ms decays to 0 in Watching → transitions to Quiet |
 | `ducking_stays_ducking_during_hold` | sustained_ms=0 in Ducking → stays Ducking (not Quiet) |
 
-#### JSON/String Parsers — 26 tests (`test_parsers.rs`)
+#### JSON/String Parsers — 38 tests (`test_parsers.rs`)
 
 Tests all parser functions extracted from the firmware: `parse_f32_field` (positive, negative, missing, no digits, trailing chars, integer), `parse_str_field` (basic, empty, missing quote, embedded quote, second field), `parse_ip` (valid, invalid octet, too few parts, zeros, max, letters), `parse_volume_from_json` (basic, missing, zero, 100), `extract_ssdp_field` (case-insensitive, missing, different fields), `parse_json_str` (basic, missing).
 
@@ -656,11 +659,11 @@ Tests all parser functions extracted from the firmware: `parse_f32_field` (posit
 
 Tests serialize/deserialize of the 256-byte config block: WiFi roundtrip, TV config roundtrip, interleaved saves (both orders), bad magic/CRC rejection, max-length SSID (63 chars), SSID truncation at 64 chars, Sony PSK max 8 chars, PSK truncation at 9 chars, empty IP disables TV, all 4 brands roundtrip, null byte in SSID truncates, empty SSID returns None.
 
-#### WebSocket Framing — 9 tests (`test_ws_frame.rs`)
+#### WebSocket Framing — 11 tests (`test_ws_frame.rs`)
 
-Tests frame encoding for short payloads (< 126 bytes, 2-byte header), extended payloads (>= 126 bytes, 4-byte header), boundary cases (exactly 125 and 126 bytes), encode→decode roundtrips, too-short frame rejection, payload unmasking, and equivalence of `ws_text_frame` and `ws_frame_unmasked`.
+Tests frame encoding for short payloads (< 126 bytes, 2-byte header), extended payloads (>= 126 bytes, 4-byte header), boundary cases (exactly 125 and 126 bytes), encode→decode roundtrips, too-short frame rejection, payload unmasking, and equivalence of `ws_text_frame` and `ws_frame_masked`.
 
-#### Audio dB Computation — 6 tests (`test_audio.rs`)
+#### Audio dB Computation — 7 tests (`test_audio.rs`)
 
 Tests silence (all-zero → -96.0 dBFS), full-scale (max 24-bit → ~0 dBFS), known RMS value (~1/10 scale → ~-20 dBFS), negative samples (same RMS as positive), single sample edge case, and very quiet signals.
 

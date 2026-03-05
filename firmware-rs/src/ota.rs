@@ -24,19 +24,11 @@ const GH_REPO: &str = match option_env!("GUARDIAN_GH_REPO") {
 
 // Static state for the reqwless TCP client (1 concurrent connection, 1 KB buffers)
 static OTA_TCP_STATE: StaticCell<TcpClientState<1, 1024, 1024>> = StaticCell::new();
-static mut OTA_TCP_REF: Option<&'static TcpClientState<1, 1024, 1024>> = None;
 
-/// One-time init — call from wifi_task after stack is up.
-pub fn init_tcp_state() {
-    let state = OTA_TCP_STATE.init(TcpClientState::new());
-    // Safety: called once from wifi_task before any other task uses it
-    unsafe { OTA_TCP_REF = Some(state); }
-}
-
-/// Get the TCP client state reference. Panics if init_tcp_state() was not called.
-pub fn get_tcp_state() -> &'static TcpClientState<1, 1024, 1024> {
-    // Safety: only read after init_tcp_state() runs in wifi_task
-    unsafe { OTA_TCP_REF.unwrap() }
+/// One-time init — call from wifi_task after stack is up. Returns a static reference
+/// for passing to OTA check/download calls.
+pub fn init_tcp_state() -> &'static TcpClientState<1, 1024, 1024> {
+    OTA_TCP_STATE.init(TcpClientState::new())
 }
 
 // ── Version comparison ────────────────────────────────────────────────────────

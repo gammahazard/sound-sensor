@@ -39,6 +39,7 @@ pub async fn websocket_task(
     engine:    &'static Mutex<ThreadModeRawMutex, DuckingEngine>,
     tv_config: &'static Mutex<ThreadModeRawMutex, TvConfig>,
     tls_seed:  u64,
+    ota_tcp:   &'static embassy_net::tcp::client::TcpClientState<1, 1024, 1024>,
 ) {
     let mut rx_buf = [0u8; RX_BUF];
     let mut tx_buf = [0u8; TX_BUF];
@@ -60,7 +61,7 @@ pub async fn websocket_task(
             continue;
         }
 
-        handle_client(socket, stack, engine, tv_config, tls_seed).await;
+        handle_client(socket, stack, engine, tv_config, tls_seed, ota_tcp).await;
         info!("[ws] Client disconnected");
     }
 }
@@ -111,6 +112,7 @@ async fn handle_client(
     engine:    &'static Mutex<ThreadModeRawMutex, DuckingEngine>,
     tv_config: &'static Mutex<ThreadModeRawMutex, TvConfig>,
     tls_seed:  u64,
+    ota_tcp:   &'static embassy_net::tcp::client::TcpClientState<1, 1024, 1024>,
 ) {
     let mut out_frame = [0u8; 1100];
 
@@ -194,14 +196,7 @@ async fn handle_client(
                                 entry.cat.as_str(),
                                 entry.level.as_str(),
                             );
-                            // Escape the message to prevent JSON breakage
-                            for &b in entry.msg.as_bytes() {
-                                match b {
-                                    b'"'  => { let _ = log_json.push_str("\\\""); }
-                                    b'\\' => { let _ = log_json.push_str("\\\\"); }
-                                    _ => { let _ = log_json.push(b as char); }
-                                }
-                            }
+                            push_json_escaped(&mut log_json, entry.msg.as_str());
                             let _ = log_json.push_str("\"}");
                             let n = ws_text_frame(log_json.as_bytes(), &mut out_frame);
                             if socket.write_all(&out_frame[..n]).await.is_err() { break; }
@@ -212,7 +207,7 @@ async fn handle_client(
 
             Either::Second(Ok(n)) if n > 0 => {
                 let last_db = { TELEMETRY.lock().await.db };
-                process_frame(&rx_buf[..n], stack, engine, tv_config, last_db, &mut socket, &mut out_frame, tls_seed).await;
+                process_frame(&rx_buf[..n], stack, engine, tv_config, last_db, &mut socket, &mut out_frame, tls_seed, ota_tcp).await;
             }
 
             Either::Second(_) => break,
@@ -230,6 +225,7 @@ async fn process_frame(
     socket:    &mut TcpSocket<'_>,
     out_frame: &mut [u8; 1100],
     tls_seed:  u64,
+    ota_tcp:   &'static embassy_net::tcp::client::TcpClientState<1, 1024, 1024>,
 ) {
     if raw.len() < 2 { return; }
     let masked  = (raw[1] & 0x80) != 0;
@@ -261,7 +257,7 @@ async fn process_frame(
         payload[..plen].copy_from_slice(&raw[hlen..hlen + plen]);
     }
 
-    apply_command(&payload[..plen], stack, engine, tv_config, last_db, socket, out_frame, tls_seed).await;
+    apply_command(&payload[..plen], stack, engine, tv_config, last_db, socket, out_frame, tls_seed, ota_tcp).await;
 }
 
 async fn apply_command(
@@ -272,7 +268,8 @@ async fn apply_command(
     last_db:   f32,
     socket:    &mut TcpSocket<'_>,
     out_frame: &mut [u8; 1100],
-    tls_seed: u64,
+    tls_seed:  u64,
+    ota_tcp:   &'static embassy_net::tcp::client::TcpClientState<1, 1024, 1024>,
 ) {
     let Ok(s) = core::str::from_utf8(payload) else { return };
     let cmd = parse_str_field(s, r#""cmd":"#);
@@ -343,13 +340,7 @@ async fn apply_command(
         // Send wifi_reconfiguring event back to client (JSON-escape the SSID)
         let mut evt: heapless::String<256> = heapless::String::new();
         let _ = evt.push_str(r#"{"evt":"wifi_reconfiguring","ssid":""#);
-        for &b in ssid_h.as_bytes() {
-            match b {
-                b'"'  => { let _ = evt.push_str("\\\""); }
-                b'\\' => { let _ = evt.push_str("\\\\"); }
-                _ => { let _ = evt.push(b as char); }
-            }
-        }
+        push_json_escaped(&mut evt, ssid_h.as_str());
         let _ = evt.push_str(r#""}"#);
         let n = ws_text_frame(evt.as_bytes(), out_frame);
         let _ = socket.write_all(&out_frame[..n]).await;
@@ -426,7 +417,7 @@ async fn apply_command(
             info!("[ws] OTA check requested");
             let result = crate::ota::check_for_update(
                 stack,
-                crate::ota::get_tcp_state(),
+                ota_tcp,
                 tls_seed,
             ).await;
             let json = crate::ota::status_json(
@@ -463,7 +454,7 @@ async fn apply_command(
 // ── Event formatters ────────────────────────────────────────────────────────
 
 /// Append a JSON-escaped string to the output (escapes `"` and `\`).
-fn push_json_escaped(out: &mut heapless::String<1024>, s: &str) {
+fn push_json_escaped<const N: usize>(out: &mut heapless::String<N>, s: &str) {
     for &b in s.as_bytes() {
         match b {
             b'"'  => { let _ = out.push_str("\\\""); }
@@ -576,6 +567,8 @@ fn ws_text_frame(payload: &[u8], out: &mut [u8]) -> usize {
     let hlen = if len < 126 { 2 } else { 4 };
     if hlen + len > out.len() {
         // Truncate payload to fit in output buffer
+        dev_log!(crate::dev_log::LogCat::Ws, crate::dev_log::LogLevel::Warn,
+            "ws_text_frame truncating {}→{}", len, out.len().saturating_sub(4));
         // Recalculate: try 2-byte header first, then 4-byte if needed
         let max2 = out.len().saturating_sub(2);
         let (trunc_hlen, trunc_len) = if max2 < 126 {

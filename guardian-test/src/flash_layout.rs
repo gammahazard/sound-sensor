@@ -10,7 +10,10 @@
 //!   Bytes 149:     tv_brand (0=Lg, 1=Samsung, 2=Sony, 3=Roku)
 //!   Bytes 150–165: samsung_token (null-terminated, max 15 chars)
 //!   Bytes 166–173: sony_psk (null-terminated, max 8 chars — but field is 8 bytes)
-//!   Bytes 174–251: reserved
+//!   Byte  174:     calibration_valid (0=no, 1=yes)
+//!   Bytes 175–178: floor_db (f32 LE)
+//!   Bytes 179–182: tripwire_db (f32 LE)
+//!   Bytes 183–251: reserved
 //!   Bytes 252–255: CRC32 over bytes 0–251
 
 use crate::crypto::crc32;
@@ -137,4 +140,43 @@ pub fn load_tv_config(buf: &[u8; 256]) -> Option<TvConfig> {
         samsung_token,
         sony_psk,
     })
+}
+
+/// Clear only WiFi credentials (bytes 4–131), preserving TV config + calibration.
+/// Falls back to zeroing the entire block if it's invalid.
+pub fn clear_wifi_creds(buf: &mut [u8; 256]) {
+    if !validate_block(buf) {
+        *buf = [0u8; 256];
+        return;
+    }
+    buf[4..132].fill(0);
+    finalize_crc(buf);
+}
+
+/// Save calibration data into a config block (read-modify-write).
+pub fn save_calibration(buf: &mut [u8; 256], floor: f32, tripwire: f32) {
+    if !validate_block(buf) {
+        *buf = [0u8; 256];
+        buf[0..4].copy_from_slice(&CONFIG_MAGIC.to_le_bytes());
+    }
+    buf[174] = 1; // calibration_valid
+    buf[175..179].copy_from_slice(&floor.to_le_bytes());
+    buf[179..183].copy_from_slice(&tripwire.to_le_bytes());
+    finalize_crc(buf);
+}
+
+/// Load calibration data from a config block.
+pub fn load_calibration(buf: &[u8; 256]) -> Option<(f32, f32)> {
+    if !validate_block(buf) {
+        return None;
+    }
+    if buf[174] == 0 {
+        return None;
+    }
+    let floor = f32::from_le_bytes([buf[175], buf[176], buf[177], buf[178]]);
+    let tripwire = f32::from_le_bytes([buf[179], buf[180], buf[181], buf[182]]);
+    if floor < -96.0 || floor > 0.0 || tripwire < -96.0 || tripwire > 0.0 {
+        return None;
+    }
+    Some((floor, tripwire))
 }

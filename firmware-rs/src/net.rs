@@ -35,10 +35,7 @@ use crate::ducking::DuckingEngine;
 use crate::tv::{TvBrand, TvConfig};
 use crate::{LedPattern, LED_CHANNEL, WifiCmd, WifiEvent, WIFI_CMD_CH, WIFI_EVT_CH, NetworkInfo};
 
-// ── Flash layout ────────────────────────────────────────────────────────────
-const FLASH_SIZE: usize = 4 * 1024 * 1024; // 4 MB
-const CONFIG_OFFSET: u32 = 0x1F_F000;       // last 4 KB sector
-const CONFIG_MAGIC: u32 = 0xBADC_0FFE;
+use crate::flash_config::*;
 
 // ── Credentials (compile-time defaults, override with env vars) ─────────────
 const DEFAULT_SSID: &str = match option_env!("GUARDIAN_SSID") {
@@ -56,183 +53,6 @@ static RESOURCES: StaticCell<StackResources<8>>  = StaticCell::new();
 
 const CYW43_FIRMWARE: &[u8] = include_bytes!("../cyw43-firmware/43439A0.bin");
 const CYW43_CLM:      &[u8] = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
-
-// ── CRC32 (for config block integrity) ──────────────────────────────────────
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    !crc
-}
-
-// ── Flash credential helpers ────────────────────────────────────────────────
-
-fn read_null_terminated(buf: &[u8]) -> &str {
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    core::str::from_utf8(&buf[..end]).unwrap_or("")
-}
-
-pub fn flash_load_creds(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>) -> Option<(heapless::String<64>, heapless::String<64>)> {
-    let mut buf = [0u8; 256];
-    if flash.blocking_read(CONFIG_OFFSET, &mut buf).is_err() {
-        return None;
-    }
-    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if magic != CONFIG_MAGIC { return None; }
-    let stored_crc = u32::from_le_bytes([buf[252], buf[253], buf[254], buf[255]]);
-    if crc32(&buf[..252]) != stored_crc { return None; }
-    let ssid_str = read_null_terminated(&buf[4..68]);
-    let pass_str = read_null_terminated(&buf[68..132]);
-    if ssid_str.is_empty() { return None; }
-    let mut ssid = heapless::String::new();
-    let _ = ssid.push_str(ssid_str);
-    let mut pass = heapless::String::new();
-    let _ = pass.push_str(pass_str);
-    Some((ssid, pass))
-}
-
-pub fn flash_save_creds(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, ssid: &str, pass: &str) {
-    // Read-modify-write to preserve TV config fields
-    let mut buf = [0u8; 256];
-    let _ = flash.blocking_read(CONFIG_OFFSET, &mut buf);
-    // Check if existing block is valid; if not, start fresh
-    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let stored_crc = u32::from_le_bytes([buf[252], buf[253], buf[254], buf[255]]);
-    if magic != CONFIG_MAGIC || crc32(&buf[..252]) != stored_crc {
-        buf = [0u8; 256];
-    }
-    // Write magic
-    buf[0..4].copy_from_slice(&CONFIG_MAGIC.to_le_bytes());
-    // Write SSID (null-terminated)
-    buf[4..68].fill(0);
-    let ssid_bytes = ssid.as_bytes();
-    buf[4..4 + ssid_bytes.len().min(63)].copy_from_slice(&ssid_bytes[..ssid_bytes.len().min(63)]);
-    // Write pass (null-terminated)
-    buf[68..132].fill(0);
-    let pass_bytes = pass.as_bytes();
-    buf[68..68 + pass_bytes.len().min(63)].copy_from_slice(&pass_bytes[..pass_bytes.len().min(63)]);
-    // Recompute CRC
-    let crc = crc32(&buf[..252]);
-    buf[252..256].copy_from_slice(&crc.to_le_bytes());
-    // Erase + write
-    if flash.blocking_erase(CONFIG_OFFSET, CONFIG_OFFSET + 4096).is_err() {
-        warn!("[net] flash erase failed (save_creds)");
-    }
-    if flash.blocking_write(CONFIG_OFFSET, &buf).is_err() {
-        warn!("[net] flash write failed (save_creds)");
-    }
-}
-
-pub fn flash_load_tv_config(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>) -> Option<TvConfig> {
-    let mut buf = [0u8; 256];
-    if flash.blocking_read(CONFIG_OFFSET, &mut buf).is_err() { return None; }
-    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if magic != CONFIG_MAGIC { return None; }
-    let stored_crc = u32::from_le_bytes([buf[252], buf[253], buf[254], buf[255]]);
-    if crc32(&buf[..252]) != stored_crc { return None; }
-    if buf[132] == 0 { return None; } // tv_enabled = 0
-    let ip_str = read_null_terminated(&buf[133..149]);
-    if ip_str.is_empty() { return None; }
-    let brand = TvBrand::from_u8(buf[149]);
-    let token_str = read_null_terminated(&buf[150..166]);
-    let psk_str = read_null_terminated(&buf[166..174]);
-    let mut cfg = TvConfig::default();
-    cfg.ip.clear();
-    let _ = cfg.ip.push_str(ip_str);
-    cfg.brand = brand;
-    cfg.samsung_token.clear();
-    let _ = cfg.samsung_token.push_str(token_str);
-    cfg.sony_psk.clear();
-    let _ = cfg.sony_psk.push_str(psk_str);
-    Some(cfg)
-}
-
-pub fn flash_save_tv_config(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, tv: &TvConfig) {
-    // Read-modify-write to preserve WiFi creds
-    let mut buf = [0u8; 256];
-    let _ = flash.blocking_read(CONFIG_OFFSET, &mut buf);
-    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let stored_crc = u32::from_le_bytes([buf[252], buf[253], buf[254], buf[255]]);
-    if magic != CONFIG_MAGIC || crc32(&buf[..252]) != stored_crc {
-        buf = [0u8; 256];
-        buf[0..4].copy_from_slice(&CONFIG_MAGIC.to_le_bytes());
-    }
-    // TV enabled flag
-    buf[132] = if tv.is_configured() { 1 } else { 0 };
-    // TV IP
-    buf[133..149].fill(0);
-    let ip_bytes = tv.ip.as_bytes();
-    buf[133..133 + ip_bytes.len().min(15)].copy_from_slice(&ip_bytes[..ip_bytes.len().min(15)]);
-    // TV brand
-    buf[149] = tv.brand.to_u8();
-    // Samsung token (16 bytes, max 16 chars; no null terminator needed at max)
-    buf[150..166].fill(0);
-    let tok_bytes = tv.samsung_token.as_bytes();
-    buf[150..150 + tok_bytes.len().min(16)].copy_from_slice(&tok_bytes[..tok_bytes.len().min(16)]);
-    // Sony PSK
-    buf[166..174].fill(0);
-    let psk_bytes = tv.sony_psk.as_bytes();
-    buf[166..166 + psk_bytes.len().min(8)].copy_from_slice(&psk_bytes[..psk_bytes.len().min(8)]);
-    // CRC
-    let crc = crc32(&buf[..252]);
-    buf[252..256].copy_from_slice(&crc.to_le_bytes());
-    if flash.blocking_erase(CONFIG_OFFSET, CONFIG_OFFSET + 4096).is_err() {
-        warn!("[net] flash erase failed (save_tv_config)");
-    }
-    if flash.blocking_write(CONFIG_OFFSET, &buf).is_err() {
-        warn!("[net] flash write failed (save_tv_config)");
-    }
-}
-
-// ── Calibration persistence ──────────────────────────────────────────────────
-
-pub fn flash_load_calibration(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>) -> Option<(f32, f32)> {
-    let mut buf = [0u8; 256];
-    if flash.blocking_read(CONFIG_OFFSET, &mut buf).is_err() { return None; }
-    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if magic != CONFIG_MAGIC { return None; }
-    let stored_crc = u32::from_le_bytes([buf[252], buf[253], buf[254], buf[255]]);
-    if crc32(&buf[..252]) != stored_crc { return None; }
-    if buf[174] == 0 { return None; } // calibration_valid = 0
-    let floor = f32::from_le_bytes([buf[175], buf[176], buf[177], buf[178]]);
-    let tripwire = f32::from_le_bytes([buf[179], buf[180], buf[181], buf[182]]);
-    // Sanity check: reject garbage values
-    if floor < -96.0 || floor > 0.0 || tripwire < -96.0 || tripwire > 0.0 {
-        return None;
-    }
-    Some((floor, tripwire))
-}
-
-pub fn flash_save_calibration(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, floor: f32, tripwire: f32) {
-    // Read-modify-write to preserve WiFi creds + TV config
-    let mut buf = [0u8; 256];
-    let _ = flash.blocking_read(CONFIG_OFFSET, &mut buf);
-    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let stored_crc = u32::from_le_bytes([buf[252], buf[253], buf[254], buf[255]]);
-    if magic != CONFIG_MAGIC || crc32(&buf[..252]) != stored_crc {
-        buf = [0u8; 256];
-        buf[0..4].copy_from_slice(&CONFIG_MAGIC.to_le_bytes());
-    }
-    buf[174] = 1; // calibration_valid
-    buf[175..179].copy_from_slice(&floor.to_le_bytes());
-    buf[179..183].copy_from_slice(&tripwire.to_le_bytes());
-    let crc = crc32(&buf[..252]);
-    buf[252..256].copy_from_slice(&crc.to_le_bytes());
-    if flash.blocking_erase(CONFIG_OFFSET, CONFIG_OFFSET + 4096).is_err() {
-        warn!("[net] flash erase failed (save_calibration)");
-    }
-    if flash.blocking_write(CONFIG_OFFSET, &buf).is_err() {
-        warn!("[net] flash write failed (save_calibration)");
-    }
-}
 
 // ── WiFi task ───────────────────────────────────────────────────────────────
 #[embassy_executor::task]
@@ -339,6 +159,9 @@ pub async fn wifi_task(
     dev_log!(crate::dev_log::LogCat::Wifi, crate::dev_log::LogLevel::Info,
         "cred_source={}", if have_flash_creds { "flash" } else if have_compile_creds { "compile" } else { "none(ap)" });
 
+    // Initialize OTA TCP client state (shared by both AP and station mode paths)
+    let ota_tcp = crate::ota::init_tcp_state();
+
     let stack: embassy_net::Stack<'static> = if enter_ap_mode {
         // ── AP MODE: No creds → start setup hotspot ─────────────────────
         info!("[net] No WiFi creds — entering AP mode");
@@ -369,7 +192,7 @@ pub async fn wifi_task(
         // Spawn setup tasks (no tv_task, no OTA)
         spawner.spawn(crate::ducking::ducking_task(engine)).unwrap();
         spawner.spawn(crate::http::http_task(stack)).unwrap();
-        spawner.spawn(crate::ws::websocket_task(stack, engine, tv_config, tls_seed)).unwrap();
+        spawner.spawn(crate::ws::websocket_task(stack, engine, tv_config, tls_seed, ota_tcp)).unwrap();
         spawner.spawn(crate::ap_services::dhcp_server_task(stack)).unwrap();
         spawner.spawn(crate::ap_services::dns_server_task(stack)).unwrap();
         spawner.spawn(mdns_responder_task(stack, "guardiansetup")).unwrap();
@@ -448,8 +271,8 @@ pub async fn wifi_task(
                 control.gpio_set(0, false).await;
                 Timer::after(Duration::from_millis(100)).await;
             }
-            // Erase config sector to clear bad credentials
-            let _ = fs.flash_mut().blocking_erase(CONFIG_OFFSET, CONFIG_OFFSET + 4096);
+            // Clear only WiFi creds, preserving TV config + calibration
+            flash_clear_creds(fs.flash_mut());
             Timer::after(Duration::from_millis(100)).await;
             cortex_m::peripheral::SCB::sys_reset();
         }
@@ -483,7 +306,7 @@ pub async fn wifi_task(
                     control.gpio_set(0, false).await;
                     Timer::after(Duration::from_millis(100)).await;
                 }
-                let _ = fs.flash_mut().blocking_erase(CONFIG_OFFSET, CONFIG_OFFSET + 4096);
+                flash_clear_creds(fs.flash_mut());
                 Timer::after(Duration::from_millis(100)).await;
                 cortex_m::peripheral::SCB::sys_reset();
             }
@@ -503,13 +326,10 @@ pub async fn wifi_task(
         let _ = control.add_multicast_address([0x01, 0x00, 0x5E, 0x00, 0x00, 0xFB]).await; // mDNS 224.0.0.251
         let _ = control.add_multicast_address([0x01, 0x00, 0x5E, 0x7F, 0xFF, 0xFA]).await; // SSDP 239.255.255.250
 
-        // ── Initialize OTA TCP client state ──────────────────────────────
-        crate::ota::init_tcp_state();
-
         // ── Spawn application-layer tasks ────────────────────────────────
         spawner.spawn(crate::ducking::ducking_task(engine)).unwrap();
         spawner.spawn(crate::http::http_task(stack)).unwrap();
-        spawner.spawn(crate::ws::websocket_task(stack, engine, tv_config, tls_seed)).unwrap();
+        spawner.spawn(crate::ws::websocket_task(stack, engine, tv_config, tls_seed, ota_tcp)).unwrap();
         spawner.spawn(crate::tv::tv_task(stack, engine, tv_config, tls_seed)).unwrap();
         spawner.spawn(mdns_responder_task(stack, "guardian")).unwrap();
 
@@ -529,7 +349,7 @@ pub async fn wifi_task(
 
         // Check for WiFi commands (non-blocking)
         if let Ok(cmd) = WIFI_CMD_CH.try_receive() {
-            handle_wifi_cmd(cmd, &mut control, &mut fs, stack, tv_config).await;
+            handle_wifi_cmd(cmd, &mut control, &mut fs, stack, tv_config, ota_tcp).await;
         }
 
         // Drive LED
@@ -573,6 +393,7 @@ async fn handle_wifi_cmd(
     fs: &mut crate::flash_fs::FlashFs,
     stack: embassy_net::Stack<'static>,
     tv_config: &'static Mutex<ThreadModeRawMutex, TvConfig>,
+    ota_tcp: &'static embassy_net::tcp::client::TcpClientState<1, 1024, 1024>,
 ) {
     match cmd {
         WifiCmd::Scan => {
@@ -620,8 +441,7 @@ async fn handle_wifi_cmd(
         }
         WifiCmd::OtaDownload { tls_seed } => {
             info!("[net] OTA download requested");
-            let tcp_state = crate::ota::get_tcp_state();
-            let result = crate::ota::download_update(stack, tcp_state, tls_seed, fs).await;
+            let result = crate::ota::download_update(stack, ota_tcp, tls_seed, fs).await;
             match result {
                 Some(version) => {
                     info!("[net] OTA download succeeded: {}", version.as_str());

@@ -1,4 +1,4 @@
-//! Guardian — Firmware (Phase 3)
+//! Guardian — Firmware (Phase 6)
 //! Rust + Embassy-rp on Raspberry Pi Pico 2 W (RP2350)
 //!
 //! Task layout:
@@ -67,6 +67,7 @@ mod audio;
 #[cfg(feature = "dev-mode")]
 mod dev_log;
 mod ducking;
+mod flash_config;
 mod flash_fs;
 mod http;
 mod net;

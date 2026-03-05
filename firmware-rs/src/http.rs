@@ -68,7 +68,7 @@ async fn handle_request(socket: &mut TcpSocket<'_>) {
     // "captive portal" and auto-opens the CNA sheet with our page inside it.
     if crate::AP_MODE.load(Ordering::Relaxed) {
         if method == "GET" {
-            serve_asset(socket, crate::setup_html::SETUP_PAGE, "text/html; charset=utf-8").await;
+            serve_response(socket, "text/html; charset=utf-8", ServeBody::Bytes(crate::setup_html::SETUP_PAGE), false).await;
         } else {
             send_error(socket, 404, "Not Found").await;
         }
@@ -87,44 +87,44 @@ async fn handle_request(socket: &mut TcpSocket<'_>) {
     match (method, path) {
         ("GET", "/" | "/index.html") => {
             if ota.index_html.1 > 0 {
-                serve_flash_gz(socket, ota.index_html, "text/html; charset=utf-8").await;
+                serve_response(socket, "text/html; charset=utf-8", ServeBody::Flash(ota.index_html.0, ota.index_html.1), true).await;
             } else {
-                serve_asset(socket, assets::INDEX_HTML, "text/html; charset=utf-8").await;
+                serve_response(socket, "text/html; charset=utf-8", ServeBody::Bytes(assets::INDEX_HTML), false).await;
             }
         }
         ("GET", "/guardian-pwa.js") => {
             if ota.guardian_js.1 > 0 {
-                serve_flash_gz(socket, ota.guardian_js, "application/javascript").await;
+                serve_response(socket, "application/javascript", ServeBody::Flash(ota.guardian_js.0, ota.guardian_js.1), true).await;
             } else {
-                serve_asset_gz(socket, assets::WASM_JS_GZ, "application/javascript").await;
+                serve_response(socket, "application/javascript", ServeBody::Bytes(assets::WASM_JS_GZ), true).await;
             }
         }
         ("GET", "/guardian-pwa_bg.wasm") => {
             if ota.guardian_wasm.1 > 0 {
-                serve_flash_gz(socket, ota.guardian_wasm, "application/wasm").await;
+                serve_response(socket, "application/wasm", ServeBody::Flash(ota.guardian_wasm.0, ota.guardian_wasm.1), true).await;
             } else {
-                serve_asset_gz(socket, assets::WASM_BG_GZ, "application/wasm").await;
+                serve_response(socket, "application/wasm", ServeBody::Bytes(assets::WASM_BG_GZ), true).await;
             }
         }
         ("GET", "/sw.js") => {
             if ota.sw_js.1 > 0 {
-                serve_flash_gz(socket, ota.sw_js, "application/javascript").await;
+                serve_response(socket, "application/javascript", ServeBody::Flash(ota.sw_js.0, ota.sw_js.1), true).await;
             } else {
-                serve_asset(socket, assets::SW_JS, "application/javascript").await;
+                serve_response(socket, "application/javascript", ServeBody::Bytes(assets::SW_JS), false).await;
             }
         }
         ("GET", "/manifest.json") => {
             if ota.manifest_json.1 > 0 {
-                serve_flash_gz(socket, ota.manifest_json, "application/manifest+json").await;
+                serve_response(socket, "application/manifest+json", ServeBody::Flash(ota.manifest_json.0, ota.manifest_json.1), true).await;
             } else {
-                serve_asset(socket, assets::MANIFEST, "application/manifest+json").await;
+                serve_response(socket, "application/manifest+json", ServeBody::Bytes(assets::MANIFEST), false).await;
             }
         }
         ("GET", "/icon-192.png") => {
-            serve_asset(socket, assets::ICON_192, "image/png").await;
+            serve_response(socket, "image/png", ServeBody::Bytes(assets::ICON_192), false).await;
         }
         ("GET", "/icon-512.png") => {
-            serve_asset(socket, assets::ICON_512, "image/png").await;
+            serve_response(socket, "image/png", ServeBody::Bytes(assets::ICON_512), false).await;
         }
         ("GET", "/version.json") => {
             let mut body: heapless::String<128> = heapless::String::new();
@@ -134,7 +134,7 @@ async fn handle_request(socket: &mut TcpSocket<'_>) {
                 crate::FW_VERSION,
                 crate::PWA_VERSION,
             );
-            serve_dynamic(socket, body.as_bytes(), "application/json").await;
+            serve_response(socket, "application/json", ServeBody::Bytes(body.as_bytes()), false).await;
         }
         ("POST", "/api/ota") => {
             handle_ota(socket).await;
@@ -145,115 +145,55 @@ async fn handle_request(socket: &mut TcpSocket<'_>) {
     }
 }
 
-// ── Asset serving (baked-in) ─────────────────────────────────────────────────
+// ── Unified response body types ──────────────────────────────────────────────
 
-async fn serve_asset(socket: &mut TcpSocket<'_>, body: &[u8], content_type: &str) {
-    let mut headers: heapless::String<256> = heapless::String::new();
-    let _ = core::write!(
-        headers,
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n",
-        content_type,
-        body.len(),
-    );
-
-    if socket.write_all(headers.as_bytes()).await.is_err() { return; }
-
-    let mut pos = 0;
-    while pos < body.len() {
-        let end = (pos + 1024).min(body.len());
-        if socket.write_all(&body[pos..end]).await.is_err() { return; }
-        pos = end;
-    }
-
-    let _ = socket.flush().await;
+enum ServeBody<'a> {
+    Bytes(&'a [u8]),
+    Flash(u32, u32), // (offset, size)
 }
 
-// ── Asset serving (baked-in, pre-gzipped) ───────────────────────────────────
+async fn serve_response(socket: &mut TcpSocket<'_>, content_type: &str, body: ServeBody<'_>, gzip: bool) {
+    let content_len = match &body {
+        ServeBody::Bytes(b) => b.len() as u32,
+        ServeBody::Flash(_, size) => *size,
+    };
 
-async fn serve_asset_gz(socket: &mut TcpSocket<'_>, body: &[u8], content_type: &str) {
     let mut headers: heapless::String<256> = heapless::String::new();
     let _ = core::write!(
         headers,
         "HTTP/1.1 200 OK\r\n\
          Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Content-Encoding: gzip\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n",
-        content_type,
-        body.len(),
+         Content-Length: {}\r\n",
+        content_type, content_len,
     );
+    if gzip {
+        let _ = headers.push_str("Content-Encoding: gzip\r\n");
+    }
+    let _ = headers.push_str("Cache-Control: no-cache\r\nConnection: close\r\n\r\n");
 
     if socket.write_all(headers.as_bytes()).await.is_err() { return; }
 
-    let mut pos = 0;
-    while pos < body.len() {
-        let end = (pos + 1024).min(body.len());
-        if socket.write_all(&body[pos..end]).await.is_err() { return; }
-        pos = end;
+    match body {
+        ServeBody::Bytes(data) => {
+            let mut pos = 0;
+            while pos < data.len() {
+                let end = (pos + 1024).min(data.len());
+                if socket.write_all(&data[pos..end]).await.is_err() { return; }
+                pos = end;
+            }
+        }
+        ServeBody::Flash(offset, size) => {
+            let mut chunk = [0u8; 1024];
+            let mut pos = 0u32;
+            while pos < size {
+                let n = ((size - pos) as usize).min(1024);
+                if !flash_read_chunk(offset + pos, &mut chunk[..n]) { return; }
+                if socket.write_all(&chunk[..n]).await.is_err() { return; }
+                pos += n as u32;
+            }
+        }
     }
 
-    let _ = socket.flush().await;
-}
-
-// ── Asset serving (flash FS, gzip-compressed) ────────────────────────────────
-
-async fn serve_flash_gz(
-    socket: &mut TcpSocket<'_>,
-    (offset, size): (u32, u32),
-    content_type: &str,
-) {
-    let mut headers: heapless::String<256> = heapless::String::new();
-    let _ = core::write!(
-        headers,
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Content-Encoding: gzip\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n",
-        content_type,
-        size,
-    );
-
-    if socket.write_all(headers.as_bytes()).await.is_err() { return; }
-
-    // Stream from flash in 1 KB chunks via XIP memory-mapped read
-    let mut chunk = [0u8; 1024];
-    let mut pos = 0u32;
-    while pos < size {
-        let n = ((size - pos) as usize).min(1024);
-        if !flash_read_chunk(offset + pos, &mut chunk[..n]) { return; }
-        if socket.write_all(&chunk[..n]).await.is_err() { return; }
-        pos += n as u32;
-    }
-
-    let _ = socket.flush().await;
-}
-
-async fn serve_dynamic(socket: &mut TcpSocket<'_>, body: &[u8], content_type: &str) {
-    let mut headers: heapless::String<256> = heapless::String::new();
-    let _ = core::write!(
-        headers,
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n",
-        content_type,
-        body.len(),
-    );
-
-    if socket.write_all(headers.as_bytes()).await.is_err() { return; }
-    let _ = socket.write_all(body).await;
     let _ = socket.flush().await;
 }
 
@@ -280,22 +220,7 @@ async fn handle_ota(socket: &mut TcpSocket<'_>) {
         current.as_str(),
         false,
     );
-
-    let mut resp: heapless::String<512> = heapless::String::new();
-    let _ = core::write!(
-        resp,
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        json.len(),
-    );
-
-    if socket.write_all(resp.as_bytes()).await.is_ok() {
-        let _ = socket.write_all(json.as_bytes()).await;
-    }
-    let _ = socket.flush().await;
+    serve_response(socket, "application/json", ServeBody::Bytes(json.as_bytes()), false).await;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

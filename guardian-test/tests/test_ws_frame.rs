@@ -123,12 +123,12 @@ fn decode_masked_frame() {
 }
 
 #[test]
-fn ws_frame_unmasked_same_as_text_frame() {
+fn ws_frame_masked_same_as_text_frame() {
     let payload = b"test";
     let mut out1 = [0u8; 64];
     let mut out2 = [0u8; 64];
     let n1 = ws_text_frame(payload, &mut out1);
-    let n2 = ws_frame_unmasked(payload, &mut out2);
+    let n2 = ws_frame_masked(payload, &mut out2);
     assert_eq!(n1, n2);
     assert_eq!(&out1[..n1], &out2[..n2]);
 }

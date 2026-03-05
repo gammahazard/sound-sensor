@@ -69,13 +69,12 @@ pub fn TvScreen(
                     </div>
                     // Dynamic status badge
                     <div style=move || {
-                        let (bg, text) = match tv_status.get() {
-                            1 => ("#92400e", "Connecting\u{2026}"),
-                            2 => ("#16a34a", "Connected"),
-                            3 => ("#dc2626", "Error"),
-                            _ => ("#475569", "Off"),
+                        let bg = match tv_status.get() {
+                            1 => "#92400e",
+                            2 => "#16a34a",
+                            3 => "#dc2626",
+                            _ => "#475569",
                         };
-                        let _ = text; // used below
                         format!("background:{};border-radius:999px;padding:4px 10px;\
                                  font-size:11px;font-weight:600", bg)
                     }>

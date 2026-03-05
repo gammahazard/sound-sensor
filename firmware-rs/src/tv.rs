@@ -108,7 +108,7 @@ impl TvConfig {
     pub fn is_configured(&self) -> bool { !self.ip.is_empty() }
 }
 
-// ── Duck command channel (ws_task → tv_task) ────────────────────────────────
+// ── Duck command channel (ducking_task → tv_task) ────────────────────────────
 static DUCK_CHANNEL: Channel<ThreadModeRawMutex, DuckCommand, 8> = Channel::new();
 
 pub async fn send_duck_command(cmd: DuckCommand) {
@@ -671,7 +671,7 @@ const LG_PAIR_MSG: &str = r#"{
 
 async fn lg_connect(socket: &mut TcpSocket<'_>, host: &str, port: u16, out: &mut [u8; 512]) -> bool {
     if !client_ws_handshake(socket, host, port, "/").await { return false; }
-    let n = ws_frame_unmasked(LG_PAIR_MSG.as_bytes(), out);
+    let n = ws_frame_masked(LG_PAIR_MSG.as_bytes(), out);
     if socket.write_all(&out[..n]).await.is_err() { return false; }
     info!("[tv/lg] Pairing sent — accept on TV if prompted");
     true
@@ -679,7 +679,7 @@ async fn lg_connect(socket: &mut TcpSocket<'_>, host: &str, port: u16, out: &mut
 
 async fn lg_get_volume(socket: &mut TcpSocket<'_>, out: &mut [u8; 512]) -> Option<u8> {
     let req = r#"{"type":"request","id":"vol_q","uri":"ssap://audio/getVolume"}"#;
-    let n = ws_frame_unmasked(req.as_bytes(), out);
+    let n = ws_frame_masked(req.as_bytes(), out);
     socket.write_all(&out[..n]).await.ok()?;
     let mut rx = [0u8; 256];
     let len = with_timeout(Duration::from_secs(2), read_ws_frame(socket, &mut rx)).await.ok()??;
@@ -688,13 +688,13 @@ async fn lg_get_volume(socket: &mut TcpSocket<'_>, out: &mut [u8; 512]) -> Optio
 
 async fn lg_volume_down(socket: &mut TcpSocket<'_>, out: &mut [u8; 512]) -> bool {
     let msg = r#"{"type":"request","id":"vol_d","uri":"ssap://audio/volumeDown"}"#;
-    let n = ws_frame_unmasked(msg.as_bytes(), out);
+    let n = ws_frame_masked(msg.as_bytes(), out);
     socket.write_all(&out[..n]).await.is_ok()
 }
 
 async fn lg_volume_up(socket: &mut TcpSocket<'_>, out: &mut [u8; 512]) -> bool {
     let msg = r#"{"type":"request","id":"vol_u","uri":"ssap://audio/volumeUp"}"#;
-    let n = ws_frame_unmasked(msg.as_bytes(), out);
+    let n = ws_frame_masked(msg.as_bytes(), out);
     socket.write_all(&out[..n]).await.is_ok()
 }
 
@@ -705,7 +705,7 @@ async fn lg_set_volume(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], vol: u8)
         r#"{{"type":"request","id":"vol_s","uri":"ssap://audio/setVolume","payload":{{"volume":{}}}}}"#,
         vol
     );
-    let n = ws_frame_unmasked(msg.as_bytes(), out);
+    let n = ws_frame_masked(msg.as_bytes(), out);
     socket.write_all(&out[..n]).await.is_ok()
 }
 
@@ -775,7 +775,7 @@ async fn samsung_key(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], key: &str)
         r#"{{"method":"ms.remote.control","params":{{"Cmd":"Click","DataOfCmd":"{}","Option":"false","TypeOfRemote":"SendRemoteKey"}}}}"#,
         key
     );
-    let n = ws_frame_unmasked(msg.as_bytes(), out);
+    let n = ws_frame_masked(msg.as_bytes(), out);
     socket.write_all(&out[..n]).await.is_ok()
 }
 
@@ -961,7 +961,7 @@ async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Option<()> {
 
 /// Build a masked WebSocket text frame (RFC 6455 requires clients to mask).
 /// Uses a fixed masking key — sufficient for non-security purposes.
-fn ws_frame_unmasked(payload: &[u8], out: &mut [u8]) -> usize {
+fn ws_frame_masked(payload: &[u8], out: &mut [u8]) -> usize {
     const MASK_KEY: [u8; 4] = [0x37, 0x5A, 0x1E, 0x9C];
     let len = payload.len();
     let hlen = if len < 126 { 2 } else { 4 };

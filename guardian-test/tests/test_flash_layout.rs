@@ -168,3 +168,63 @@ fn empty_ssid_returns_none() {
     save_wifi_creds(&mut buf, "", "pass");
     assert!(load_wifi_creds(&buf).is_none());
 }
+
+// ── clear_wifi_creds ────────────────────────────────────────────────────────
+
+#[test]
+fn clear_creds_preserves_tv_config() {
+    let mut buf = [0u8; 256];
+    save_wifi_creds(&mut buf, "HomeWiFi", "secret123");
+    let tv = make_tv_config("192.168.1.50", TvBrand::Samsung, "tok999", "");
+    save_tv_config(&mut buf, &tv);
+    // Verify both exist
+    assert!(load_wifi_creds(&buf).is_some());
+    assert!(load_tv_config(&buf).is_some());
+    // Clear creds
+    clear_wifi_creds(&mut buf);
+    // WiFi should be gone, TV should survive
+    assert!(load_wifi_creds(&buf).is_none());
+    let tv_loaded = load_tv_config(&buf).unwrap();
+    assert_eq!(tv_loaded.ip.as_str(), "192.168.1.50");
+    assert_eq!(tv_loaded.brand, TvBrand::Samsung);
+    assert_eq!(tv_loaded.samsung_token.as_str(), "tok999");
+}
+
+#[test]
+fn clear_creds_preserves_calibration() {
+    let mut buf = [0u8; 256];
+    save_wifi_creds(&mut buf, "Net", "pass");
+    save_calibration(&mut buf, -42.0, -20.0);
+    // Clear creds
+    clear_wifi_creds(&mut buf);
+    // WiFi gone
+    assert!(load_wifi_creds(&buf).is_none());
+    // Calibration survives
+    let (floor, tripwire) = load_calibration(&buf).unwrap();
+    assert!((floor - (-42.0)).abs() < 0.001);
+    assert!((tripwire - (-20.0)).abs() < 0.001);
+}
+
+#[test]
+fn clear_creds_on_invalid_block() {
+    // An invalid block should be fully zeroed (no panic)
+    let mut buf = [0xAA; 256];
+    clear_wifi_creds(&mut buf);
+    // Should be all zeros now
+    assert!(buf.iter().all(|&b| b == 0));
+}
+
+// ── Calibration ─────────────────────────────────────────────────────────────
+
+#[test]
+fn calibration_roundtrip() {
+    let mut buf = [0u8; 256];
+    save_wifi_creds(&mut buf, "Net", "pass");
+    save_calibration(&mut buf, -45.5, -18.3);
+    let (floor, tripwire) = load_calibration(&buf).unwrap();
+    assert!((floor - (-45.5)).abs() < 0.001);
+    assert!((tripwire - (-18.3)).abs() < 0.001);
+    // WiFi should survive
+    let creds = load_wifi_creds(&buf).unwrap();
+    assert_eq!(creds.ssid.as_str(), "Net");
+}

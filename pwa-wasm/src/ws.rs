@@ -185,26 +185,33 @@ mod tests {
 
 // ── WebSocket hook ──────────────────────────────────────────────────────────
 
-pub fn use_websocket(
-    set_db:               WriteSignal<f32>,
-    set_armed:            WriteSignal<bool>,
-    set_tripwire:         WriteSignal<f32>,
-    set_ws_state:         WriteSignal<WsState>,
-    set_fw_ver:           WriteSignal<String>,
-    set_pwa_ver:          WriteSignal<String>,
-    set_msg_count:        WriteSignal<u32>,
-    set_ducking:          WriteSignal<bool>,
-    set_tv_status:        WriteSignal<u8>,
-    set_wifi_networks:    WriteSignal<Vec<NetworkInfo>>,
-    set_discovered_tvs:   WriteSignal<Vec<DiscoveredTv>>,
-    set_ota_status:       WriteSignal<OtaStatus>,
-    // Dev mode signals
-    set_dev_mode:         WriteSignal<bool>,
-    set_dev_logs:         WriteSignal<Vec<DevLogEntry>>,
-    set_raw_ws_log:       WriteSignal<Vec<RawWsEntry>>,
-    set_reconnect_count:  WriteSignal<u32>,
-    set_last_msg_time:    WriteSignal<String>,
-) -> impl Fn(String) + Clone + 'static {
+pub struct WsSignals {
+    pub set_db:              WriteSignal<f32>,
+    pub set_armed:           WriteSignal<bool>,
+    pub set_tripwire:        WriteSignal<f32>,
+    pub set_ws_state:        WriteSignal<WsState>,
+    pub set_fw_ver:          WriteSignal<String>,
+    pub set_pwa_ver:         WriteSignal<String>,
+    pub set_msg_count:       WriteSignal<u32>,
+    pub set_ducking:         WriteSignal<bool>,
+    pub set_tv_status:       WriteSignal<u8>,
+    pub set_wifi_networks:   WriteSignal<Vec<NetworkInfo>>,
+    pub set_discovered_tvs:  WriteSignal<Vec<DiscoveredTv>>,
+    pub set_ota_status:      WriteSignal<OtaStatus>,
+    pub set_dev_mode:        WriteSignal<bool>,
+    pub set_dev_logs:        WriteSignal<Vec<DevLogEntry>>,
+    pub set_raw_ws_log:      WriteSignal<Vec<RawWsEntry>>,
+    pub set_reconnect_count: WriteSignal<u32>,
+    pub set_last_msg_time:   WriteSignal<String>,
+}
+
+pub fn use_websocket(signals: WsSignals) -> impl Fn(String) + Clone + 'static {
+    let WsSignals {
+        set_db, set_armed, set_tripwire, set_ws_state,
+        set_fw_ver, set_pwa_ver, set_msg_count,
+        set_ducking, set_tv_status, set_wifi_networks, set_discovered_tvs, set_ota_status,
+        set_dev_mode, set_dev_logs, set_raw_ws_log, set_reconnect_count, set_last_msg_time,
+    } = signals;
     let (tx, mut rx) = futures::channel::mpsc::unbounded::<String>();
     let tx_send = tx.clone();
 
