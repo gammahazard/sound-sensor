@@ -2,17 +2,16 @@
  * Guardian — Service Worker (WASM build)
  * Enables offline access and "Add to Home Screen" full-screen launch.
  *
- * File names are fixed (data-no-hash in Trunk.toml) so the SHELL list is stable.
- * Cache-first for app shell; WebSocket traffic is never cached.
+ * Strategy: network-first for app shell (picks up OTA updates immediately),
+ * falls back to cache when offline. WebSocket traffic is never cached.
  */
 
-const CACHE_NAME = 'guardian-wasm-v1';  // bump when PWA assets change
+const CACHE_NAME = 'guardian-wasm-v1';
 const SHELL = [
     '/',
     '/index.html',
-    '/guardian_pwa.js',
-    '/guardian_pwa_bg.wasm',
-    '/sw.js',
+    '/guardian-pwa.js',
+    '/guardian-pwa_bg.wasm',
     '/manifest.json',
     '/icon-192.png',
     '/icon-512.png',
@@ -39,16 +38,22 @@ self.addEventListener('fetch', (e) => {
     const url = new URL(e.request.url);
     if (url.protocol === 'ws:' || url.protocol === 'wss:') return;
 
+    // Network-first: try network, fall back to cache (enables OTA updates)
     e.respondWith(
-        caches.match(e.request).then(cached => {
-            if (cached) return cached;
-            return fetch(e.request).then(response => {
-                if (SHELL.includes(url.pathname)) {
+        fetch(e.request)
+            .then(response => {
+                // Update cache with fresh response
+                if (response.ok && SHELL.includes(url.pathname)) {
                     const clone = response.clone();
                     caches.open(CACHE_NAME).then(c => c.put(e.request, clone));
                 }
                 return response;
-            });
-        })
+            })
+            .catch(() => {
+                // Network failed — serve from cache (offline support)
+                return caches.match(e.request).then(r =>
+                    r || new Response('Offline', { status: 503, statusText: 'Service Unavailable' })
+                );
+            })
     );
 });

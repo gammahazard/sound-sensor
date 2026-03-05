@@ -3,7 +3,7 @@
 //! Shows firmware version, PWA version, WebSocket connection state,
 //! message count, OTA check button, and the rolling event log.
 
-use leptos::*;
+use leptos::prelude::*;
 use crate::EventEntry;
 use crate::ws::{WsState, OtaStatus};
 
@@ -11,15 +11,17 @@ use crate::ws::{WsState, OtaStatus};
 
 #[component]
 pub fn InfoScreen(
-    ws_state:     ReadSignal<WsState>,
-    fw_ver:       ReadSignal<String>,
-    pwa_ver:      ReadSignal<String>,
-    msg_count:    ReadSignal<u32>,
-    events:       ReadSignal<Vec<EventEntry>>,
-    ota_status:   ReadSignal<OtaStatus>,
-    on_ota_check: impl Fn() + 'static,
+    ws_state:       ReadSignal<WsState>,
+    fw_ver:         ReadSignal<String>,
+    pwa_ver:        ReadSignal<String>,
+    msg_count:      ReadSignal<u32>,
+    events:         ReadSignal<Vec<EventEntry>>,
+    ota_status:     ReadSignal<OtaStatus>,
+    on_ota_check:   impl Fn() + 'static,
+    on_ota_download: impl Fn() + 'static,
 ) -> impl IntoView {
-    let on_ota_check = store_value(on_ota_check);
+    let on_ota_check = StoredValue::new_local(on_ota_check);
+    let on_ota_download = StoredValue::new_local(on_ota_download);
 
     let host = web_sys::window()
         .and_then(|w| w.location().hostname().ok())
@@ -104,17 +106,18 @@ pub fn InfoScreen(
                 <div style="font-weight:700">"Updates"</div>
 
                 <button
-                    on:click=move |_| on_ota_check.get_value()()
-                    disabled=move || matches!(ota_status.get(), OtaStatus::Checking)
+                    on:click=move |_| on_ota_check.with_value(|f| f())
+                    disabled=move || matches!(ota_status.get(), OtaStatus::Checking | OtaStatus::Downloading)
                     style=move || format!(
                         "width:100%;padding:10px;border-radius:12px;border:none;\
                          background:{};color:white;font-size:14px;\
                          font-weight:600;cursor:pointer",
-                        if matches!(ota_status.get(), OtaStatus::Checking) { "#475569" } else { "#6366f1" }
+                        if matches!(ota_status.get(), OtaStatus::Checking | OtaStatus::Downloading) { "#475569" } else { "#6366f1" }
                     )
                 >
                     {move || match ota_status.get() {
                         OtaStatus::Checking => "Checking…".to_string(),
+                        OtaStatus::Downloading => "Downloading…".to_string(),
                         _ => "Check for Updates".to_string(),
                     }}
                 </button>
@@ -122,25 +125,46 @@ pub fn InfoScreen(
                 // OTA status display
                 {move || {
                     match ota_status.get() {
-                        OtaStatus::Idle | OtaStatus::Checking => ().into_view(),
+                        OtaStatus::Idle | OtaStatus::Checking => ().into_any(),
+                        OtaStatus::Error => view! {
+                            <div style="background:#450a0a;border-radius:10px;padding:10px;\
+                                        font-size:13px;color:#fca5a5;font-weight:500">
+                                "Download failed. Check your internet connection and try again."
+                            </div>
+                        }.into_any(),
+                        OtaStatus::Downloading => view! {
+                            <div style="background:#451a03;border-radius:10px;padding:10px;\
+                                        font-size:13px;color:#fde68a;font-weight:500">
+                                "Downloading update… This may take a minute."
+                            </div>
+                        }.into_any(),
                         OtaStatus::UpToDate { current } => view! {
                             <div style="background:#14532d;border-radius:10px;padding:10px;\
                                         font-size:13px;color:#86efac;font-weight:500">
                                 {format!("Up to date (v{})", current)}
                             </div>
-                        }.into_view(),
+                        }.into_any(),
                         OtaStatus::Available { latest, current } => view! {
                             <div style="background:#451a03;border-radius:10px;padding:10px;\
-                                        font-size:13px;color:#fde68a;font-weight:500">
-                                {format!("Update available: v{} → v{}", current, latest)}
+                                        font-size:13px;color:#fde68a;font-weight:500;\
+                                        display:flex;flex-direction:column;gap:10px">
+                                <div>{format!("Update available: v{} → v{}", current, latest)}</div>
+                                <button
+                                    on:click=move |_| on_ota_download.with_value(|f| f())
+                                    style="padding:8px;border-radius:8px;border:none;\
+                                           background:#6366f1;color:white;font-size:13px;\
+                                           font-weight:600;cursor:pointer"
+                                >
+                                    "Download Update"
+                                </button>
                             </div>
-                        }.into_view(),
+                        }.into_any(),
                         OtaStatus::Done { pwa } => view! {
                             <div style="background:#14532d;border-radius:10px;padding:10px;\
                                         font-size:13px;color:#86efac;font-weight:500">
                                 {format!("Updated to v{}! Refresh the page.", pwa)}
                             </div>
-                        }.into_view(),
+                        }.into_any(),
                     }
                 }}
             </div>
@@ -156,7 +180,7 @@ pub fn InfoScreen(
                             <div style="font-size:12px;color:#475569;text-align:center;padding:8px 0">
                                 "No events yet."
                             </div>
-                        }.into_view()
+                        }.into_any()
                     } else {
                         evts.iter().map(|e| {
                             let msg  = e.msg.clone();
@@ -170,7 +194,7 @@ pub fn InfoScreen(
                                                  margin-left:8px">{time}</span>
                                 </div>
                             }
-                        }).collect_view().into_view()
+                        }).collect_view().into_any()
                     }
                 }}
             </div>

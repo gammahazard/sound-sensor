@@ -3,7 +3,7 @@
 //! Brand selection → IP entry → optional Sony PSK → Connect.
 //! SSDP discover button shows discovered TVs with tap-to-autofill.
 
-use leptos::*;
+use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use crate::ws::DiscoveredTv;
 
@@ -29,14 +29,21 @@ pub fn TvScreen(
     discovered_tvs: ReadSignal<Vec<DiscoveredTv>>,
     on_discover:    impl Fn() + 'static,
 ) -> impl IntoView {
-    let on_connect    = store_value(on_connect);
-    let on_disconnect = store_value(on_disconnect);
-    let on_discover   = store_value(on_discover);
+    let on_connect    = StoredValue::new_local(on_connect);
+    let on_disconnect = StoredValue::new_local(on_disconnect);
+    let on_discover   = StoredValue::new_local(on_discover);
 
-    let (brand_sel, set_brand_sel)     = create_signal(tv_brand.get_untracked());
-    let (result_msg, set_result)       = create_signal(String::new());
-    let (result_ok,  set_result_ok)    = create_signal(false);
-    let (discovering, set_discovering) = create_signal(false);
+    let (brand_sel, set_brand_sel)     = signal(tv_brand.get_untracked());
+    let (result_msg, set_result)       = signal(String::new());
+    let (result_ok,  set_result_ok)    = signal(false);
+    let (discovering, set_discovering) = signal(false);
+
+    // Clear discovering spinner when results arrive
+    Effect::new(move || {
+        if !discovered_tvs.get().is_empty() {
+            set_discovering.set(false);
+        }
+    });
 
     // ── Connected card ──────────────────────────────────────────────────────
     let connected_card = move || {
@@ -58,10 +65,11 @@ pub fn TvScreen(
                 </div>
                 <button
                     on:click=move |_| {
-                        set_tv_ip(String::new());
-                        set_tv_connected(false);
-                        set_result(String::new());
-                        on_disconnect.get_value()();
+                        crate::haptic();
+                        set_tv_ip.set(String::new());
+                        set_tv_connected.set(false);
+                        set_result.set(String::new());
+                        on_disconnect.with_value(|f| f());
                     }
                     style="margin-top:14px;width:100%;padding:10px;border-radius:12px;\
                            border:1px solid #475569;background:transparent;color:#f1f5f9;\
@@ -80,7 +88,7 @@ pub fn TvScreen(
             let label = *label;
             view! {
                 <button
-                    on:click=move |_| set_brand_sel(key.to_string())
+                    on:click=move |_| set_brand_sel.set(key.to_string())
                     style=move || format!(
                         "flex:1;padding:10px 4px;border-radius:10px;border:2px solid {};\
                          background:{};color:{};font-size:12px;font-weight:600;\
@@ -111,13 +119,13 @@ pub fn TvScreen(
                 // SSDP discover button
                 <button
                     on:click=move |_| {
-                        set_discovering(true);
-                        on_discover.get_value()();
+                        set_discovering.set(true);
+                        on_discover.with_value(|f| f());
                         // Auto-reset after 4s
                         let set_d = set_discovering.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             gloo_timers::future::TimeoutFuture::new(4_000).await;
-                            set_d(false);
+                            set_d.set(false);
                         });
                     }
                     disabled=move || discovering.get()
@@ -134,7 +142,7 @@ pub fn TvScreen(
                 // Discovered TV list
                 {move || {
                     let tvs = discovered_tvs.get();
-                    if tvs.is_empty() { return ().into_view(); }
+                    if tvs.is_empty() { return ().into_any(); }
                     view! {
                         <div style="display:flex;flex-direction:column;gap:6px">
                             <div style="font-size:11px;color:#475569">"FOUND TVs"</div>
@@ -148,7 +156,7 @@ pub fn TvScreen(
                                     <button
                                         on:click=move |_| {
                                             set_input_value("tv-ip-input", &ip2);
-                                            set_brand_sel(brand2.clone());
+                                            set_brand_sel.set(brand2.clone());
                                         }
                                         style="text-align:left;width:100%;padding:10px 12px;\
                                                border-radius:10px;border:1px solid #334155;\
@@ -167,7 +175,7 @@ pub fn TvScreen(
                                 }
                             }).collect_view()}
                         </div>
-                    }.into_view()
+                    }.into_any()
                 }}
 
                 // IP input
@@ -179,7 +187,7 @@ pub fn TvScreen(
                         inputmode="decimal"
                         placeholder="192.168.1.x"
                         style="background:#0f172a;border:1px solid #334155;border-radius:10px;\
-                               padding:10px 12px;color:#f1f5f9;font-size:15px;width:100%"
+                               padding:10px 12px;color:#f1f5f9;font-size:16px;width:100%"
                     />
                     <span style="font-size:11px;color:#475569">
                         "Find in: Router admin page or use Discover above"
@@ -197,7 +205,7 @@ pub fn TvScreen(
                             placeholder="e.g. 1234"
                             maxlength="8"
                             style="background:#0f172a;border:1px solid #334155;border-radius:10px;\
-                                   padding:10px 12px;color:#f1f5f9;font-size:15px;width:100%"
+                                   padding:10px 12px;color:#f1f5f9;font-size:16px;width:100%"
                         />
                         <span style="font-size:11px;color:#475569">
                             "On TV: Settings → Network → Home Network Setup → IP Control → Pre-Shared Key"
@@ -237,6 +245,7 @@ pub fn TvScreen(
                 // Connect button
                 <button
                     on:click=move |_| {
+                        crate::haptic();
                         let ip = get_input_value("tv-ip-input");
                         let brand = brand_sel.get_untracked();
                         let psk = if brand == "sony" {
@@ -246,18 +255,18 @@ pub fn TvScreen(
                         };
 
                         if ip.is_empty() {
-                            set_result("Enter the TV's IP address".to_string());
-                            set_result_ok(false);
+                            set_result.set("Enter the TV's IP address".to_string());
+                            set_result_ok.set(false);
                             return;
                         }
                         if !is_valid_ip(&ip) {
-                            set_result("Use format 192.168.1.x".to_string());
-                            set_result_ok(false);
+                            set_result.set("Use format 192.168.1.x".to_string());
+                            set_result_ok.set(false);
                             return;
                         }
                         if brand == "sony" && psk.is_empty() {
-                            set_result("Sony requires a Pre-Shared Key PIN".to_string());
-                            set_result_ok(false);
+                            set_result.set("Sony requires a Pre-Shared Key PIN".to_string());
+                            set_result_ok.set(false);
                             return;
                         }
 
@@ -266,13 +275,13 @@ pub fn TvScreen(
                         } else {
                             format!("Connecting to {}…", ip)
                         };
-                        set_result(msg);
-                        set_result_ok(true);
+                        set_result.set(msg);
+                        set_result_ok.set(true);
 
-                        set_tv_ip(ip.clone());
-                        set_tv_brand(brand.clone());
-                        set_tv_connected(true);
-                        on_connect.get_value()(ip, brand, psk);
+                        set_tv_ip.set(ip.clone());
+                        set_tv_brand.set(brand.clone());
+                        set_tv_connected.set(true);
+                        on_connect.with_value(|f| f(ip, brand, psk));
                     }
                     style="width:100%;padding:14px;border-radius:12px;border:none;\
                            background:#6366f1;color:white;font-size:16px;\
@@ -294,9 +303,9 @@ pub fn TvScreen(
             </div>
 
             {move || if tv_connected.get() {
-                connected_card().into_view()
+                connected_card().into_any()
             } else {
-                setup_card().into_view()
+                setup_card().into_any()
             }}
         </div>
     }
@@ -326,4 +335,54 @@ fn set_input_value(id: &str, val: &str) {
 fn is_valid_ip(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_valid_ip_good() {
+        assert!(is_valid_ip("192.168.1.100"));
+    }
+
+    #[test]
+    fn is_valid_ip_zeros() {
+        assert!(is_valid_ip("0.0.0.0"));
+    }
+
+    #[test]
+    fn is_valid_ip_max() {
+        assert!(is_valid_ip("255.255.255.255"));
+    }
+
+    #[test]
+    fn is_valid_ip_too_few() {
+        assert!(!is_valid_ip("192.168.1"));
+    }
+
+    #[test]
+    fn is_valid_ip_too_many() {
+        assert!(!is_valid_ip("192.168.1.1.1"));
+    }
+
+    #[test]
+    fn is_valid_ip_overflow() {
+        assert!(!is_valid_ip("192.168.1.256"));
+    }
+
+    #[test]
+    fn is_valid_ip_letters() {
+        assert!(!is_valid_ip("abc.def.ghi.jkl"));
+    }
+
+    #[test]
+    fn is_valid_ip_empty() {
+        assert!(!is_valid_ip(""));
+    }
+
+    #[test]
+    fn is_valid_ip_negative() {
+        assert!(!is_valid_ip("192.168.1.-1"));
+    }
 }

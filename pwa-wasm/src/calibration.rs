@@ -4,7 +4,7 @@
 //!   Step 1: Record silence → sets noise floor
 //!   Step 2: Record TV at preferred max → sets tripwire 3 dB below
 
-use leptos::*;
+use leptos::prelude::*;
 
 fn local_get_f32(key: &str, default: f32) -> f32 {
     web_sys::window()
@@ -35,18 +35,22 @@ pub fn CalibrationScreen(
     on_max:       impl Fn(f32) + 'static,
     on_threshold: impl Fn(f32) + 'static,
 ) -> impl IntoView {
-    let on_silence   = store_value(on_silence);
-    let on_max       = store_value(on_max);
-    let on_threshold = store_value(on_threshold);
+    let on_silence   = StoredValue::new_local(on_silence);
+    let on_max       = StoredValue::new_local(on_max);
+    let on_threshold = StoredValue::new_local(on_threshold);
 
-    let (silence_done, set_silence_done) = create_signal(false);
-    let (silence_db,   set_silence_db)   = create_signal(local_get_f32("floor",    -60.0));
-    let (max_done,     set_max_done)      = create_signal(false);
-    let (max_db,       set_max_db)        = create_signal(local_get_f32("max",      -20.0));
-    let (slider_val,   set_slider_val)    = create_signal(local_get_f32("tripwire", -20.0));
+    let (silence_done, set_silence_done) = signal(false);
+    let (silence_db,   set_silence_db)   = signal(local_get_f32("floor",    -60.0));
+    let (max_done,     set_max_done)     = signal(false);
+    let (max_db,       set_max_db)       = signal(local_get_f32("max",      -20.0));
+    let (slider_val,   set_slider_val)   = signal(local_get_f32("tripwire", -20.0));
+    let (user_editing, set_user_editing) = signal(false);
 
-    create_effect(move |_| {
-        set_slider_val(tripwire.get());
+    Effect::new(move || {
+        let tw = tripwire.get();
+        if !user_editing.get() {
+            set_slider_val.set(tw);
+        }
     });
 
     view! {
@@ -78,11 +82,12 @@ pub fn CalibrationScreen(
             >
                 <button
                     on:click=move |_| {
+                        crate::haptic();
                         let db = current_db.get_untracked();
-                        set_silence_db(db);
+                        set_silence_db.set(db);
                         local_set_f32("floor", db);
-                        set_silence_done(true);
-                        on_silence.get_value()(db);
+                        set_silence_done.set(true);
+                        on_silence.with_value(|f| f(db));
                     }
                     style="width:100%;padding:12px;border-radius:12px;border:none;\
                            background:#334155;color:#f1f5f9;font-size:15px;\
@@ -112,14 +117,15 @@ pub fn CalibrationScreen(
             >
                 <button
                     on:click=move |_| {
+                        crate::haptic();
                         let db = current_db.get_untracked();
-                        set_max_db(db);
+                        set_max_db.set(db);
                         local_set_f32("max", db);
                         let tw = db - 3.0;
-                        set_slider_val(tw);
+                        set_slider_val.set(tw);
                         local_set_f32("tripwire", tw);
-                        set_max_done(true);
-                        on_max.get_value()(db);
+                        set_max_done.set(true);
+                        on_max.with_value(|f| f(db));
                     }
                     style="width:100%;padding:12px;border-radius:12px;border:none;\
                            background:#334155;color:#f1f5f9;font-size:15px;\
@@ -149,8 +155,9 @@ pub fn CalibrationScreen(
                         min="-60" max="-3" step="1"
                         prop:value=move || slider_val.get().to_string()
                         on:input=move |e| {
+                            set_user_editing.set(true);
                             let val: f32 = event_target_value(&e).parse().unwrap_or(-20.0);
-                            set_slider_val(val);
+                            set_slider_val.set(val);
                         }
                         style="flex:1;accent-color:#6366f1"
                     />
@@ -161,9 +168,10 @@ pub fn CalibrationScreen(
                 </div>
                 <button
                     on:click=move |_| {
+                        set_user_editing.set(false);
                         let v = slider_val.get_untracked();
                         local_set_f32("tripwire", v);
-                        on_threshold.get_value()(v);
+                        on_threshold.with_value(|f| f(v));
                     }
                     style="margin-top:12px;width:100%;padding:10px;border-radius:12px;\
                            border:none;background:#6366f1;color:white;\

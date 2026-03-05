@@ -10,6 +10,10 @@ path  = "src/main.rs"
 test  = false
 bench = false
 
+[features]
+default  = []
+dev-mode = []
+
 # ── Dependencies ──────────────────────────────────────────────────────────────
 [dependencies]
 # Embassy core
@@ -22,8 +26,8 @@ embassy-futures    = { version = "0.1" }
 embassy-rp = {
     version  = "0.3",
     features = [
-        "rp2350",
-        "time-driver-timer0",
+        "rp235xa",
+        "time-driver",
         "unstable-pac",
         "rom-v2-intrinsics",
     ]
@@ -32,7 +36,7 @@ embassy-rp = {
 # Networking (lwIP wrapper)
 embassy-net = {
     version  = "0.6",
-    features = ["tcp", "udp", "dns", "dhcpv4", "medium-ethernet"]
+    features = ["tcp", "udp", "dns", "dhcpv4", "medium-ethernet", "multicast"]
 }
 
 # CYW43 WiFi chip driver (on-chip WiFi for Pico W/Pico 2 W)
@@ -51,17 +55,27 @@ panic-probe = { version = "0.3", features = ["print-defmt"] }
 
 # Utilities
 heapless        = "0.8"
-static-cell     = "2"
+static_cell     = "2"
 portable-atomic = { version = "1", features = ["critical-section"] }
 
 # Math (used in audio.rs for log10/sqrt in no_std)
 libm = "0.2"
 
+# Fixed-point arithmetic (used for PIO clock_divider)
+fixed = { version = "1", default-features = false }
+
 # PIO assembly (used in audio.rs)
 pio-proc = "0.2"
+pio = "0.2"
 
 # Cortex-M (for SCB::sys_reset)
-cortex-m = "0.7"
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+
+# TLS + HTTP client (OTA downloads + Samsung port 8002)
+reqwless     = { version = "0.13", default-features = false, features = ["embedded-tls", "defmt"] }
+embedded-tls = { version = "0.17", default-features = false, features = ["defmt"] }
+rand_core    = "0.6"
 
 # ── Build profile ─────────────────────────────────────────────────────────────
 [profile.release]

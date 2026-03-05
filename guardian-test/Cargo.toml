@@ -1,0 +1,8 @@
+[package]
+name = "guardian-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+heapless = "0.8"
+libm = "0.2"

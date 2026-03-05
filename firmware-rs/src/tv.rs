@@ -6,14 +6,19 @@
 //!   Sony       — Bravia REST JSON-RPC on port 80
 //!   Roku       — ECP HTTP on port 8060
 
+use core::fmt::Write;
 use defmt::*;
-use embassy_net::{Stack, TcpSocket, UdpSocket, IpAddress, IpEndpoint};
+use embedded_io_async::Write as _;
+use embassy_net::{Stack, IpAddress, IpEndpoint};
+use embassy_net::tcp::TcpSocket;
+use embassy_net::udp::UdpSocket;
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel, mutex::Mutex};
 use embassy_time::{Duration, Timer, with_timeout};
-use cyw43_pio::NetDriver;
 
 use crate::ducking::{DuckCommand, DuckingEngine};
 use crate::{WifiCmd, WIFI_CMD_CH};
+
+const SAMSUNG_TLS_PORT: u16 = 8002;
 
 const RESTORE_STEP_MS: u64 = 400;
 const SAMSUNG_APP_B64: &str = "R3VhcmRpYW5TZW5zb3I=";
@@ -71,7 +76,7 @@ impl TvBrand {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, defmt::Format)]
 pub struct TvConfig {
     pub ip:            heapless::String<16>,
     pub brand:         TvBrand,
@@ -82,7 +87,10 @@ pub struct TvConfig {
 impl TvConfig {
     pub fn default() -> Self {
         let mut ip = heapless::String::new();
-        let _ = ip.push_str(option_env!("GUARDIAN_TV_IP").unwrap_or(""));
+        let _ = ip.push_str(match option_env!("GUARDIAN_TV_IP") {
+            Some(v) => v,
+            None => "",
+        });
         Self {
             ip,
             brand:         TvBrand::Lg,
@@ -95,10 +103,13 @@ impl TvConfig {
 }
 
 // ── Duck command channel (ws_task → tv_task) ────────────────────────────────
-static DUCK_CHANNEL: Channel<ThreadModeRawMutex, DuckCommand, 4> = Channel::new();
+static DUCK_CHANNEL: Channel<ThreadModeRawMutex, DuckCommand, 8> = Channel::new();
 
 pub async fn send_duck_command(cmd: DuckCommand) {
-    let _ = DUCK_CHANNEL.try_send(cmd);
+    if DUCK_CHANNEL.try_send(cmd).is_err() {
+        dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Warn,
+            "DUCK_CHANNEL full");
+    }
 }
 
 // ── SSDP discovery ──────────────────────────────────────────────────────────
@@ -112,10 +123,13 @@ pub struct DiscoveredTv {
 }
 
 /// Send SSDP M-SEARCH and collect TV responses (~3 seconds).
-pub async fn discover_tvs(stack: &'static Stack<NetDriver<'static>>) -> heapless::Vec<DiscoveredTv, 8> {
+pub async fn discover_tvs(stack: Stack<'static>) -> heapless::Vec<DiscoveredTv, 8> {
     let mut results: heapless::Vec<DiscoveredTv, 8> = heapless::Vec::new();
 
-    let mut rx_buf = [0u8; 512];
+    // Join SSDP multicast group so embassy-net accepts responses
+    let _ = stack.join_multicast_group(embassy_net::Ipv4Address::new(239, 255, 255, 250));
+
+    let mut rx_buf = [0u8; 1024];
     let mut tx_buf = [0u8; 256];
     let mut rx_meta = [embassy_net::udp::PacketMetadata::EMPTY; 4];
     let mut tx_meta = [embassy_net::udp::PacketMetadata::EMPTY; 4];
@@ -123,6 +137,7 @@ pub async fn discover_tvs(stack: &'static Stack<NetDriver<'static>>) -> heapless
     let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
     if socket.bind(0).is_err() {
         warn!("[tv] SSDP: failed to bind UDP");
+        let _ = stack.leave_multicast_group(embassy_net::Ipv4Address::new(239, 255, 255, 250));
         return results;
     }
 
@@ -143,21 +158,29 @@ pub async fn discover_tvs(stack: &'static Stack<NetDriver<'static>>) -> heapless
             Ok(Ok((n, from))) => {
                 let resp = core::str::from_utf8(&resp_buf[..n]).unwrap_or("");
 
-                // Determine brand from SSDP response
-                let brand = if resp.contains("webos") || resp.contains("LG") {
-                    "lg"
-                } else if resp.contains("samsung") || resp.contains("Samsung") {
-                    "samsung"
-                } else if resp.contains("sony") || resp.contains("Sony") || resp.contains("BRAVIA") {
-                    "sony"
-                } else if resp.contains("roku") || resp.contains("Roku") {
-                    "roku"
-                } else {
-                    continue; // Not a TV we support
+                // Determine brand from SSDP response (case-insensitive byte scan)
+                let brand = {
+                    // Check for brand keywords case-insensitively without alloc
+                    let has = |kw: &[u8]| {
+                        resp_buf[..n].windows(kw.len()).any(|w| {
+                            w.iter().zip(kw).all(|(a, b)| a.to_ascii_lowercase() == *b)
+                        })
+                    };
+                    if has(b"webos") || has(b"lg") {
+                        "lg"
+                    } else if has(b"samsung") {
+                        "samsung"
+                    } else if has(b"sony") || has(b"bravia") {
+                        "sony"
+                    } else if has(b"roku") {
+                        "roku"
+                    } else {
+                        continue; // Not a TV we support
+                    }
                 };
 
                 let ip_str = {
-                    let addr = from.addr;
+                    let addr = from.endpoint.addr;
                     let mut s: heapless::String<16> = heapless::String::new();
                     let _ = core::write!(s, "{}", addr);
                     s
@@ -166,9 +189,8 @@ pub async fn discover_tvs(stack: &'static Stack<NetDriver<'static>>) -> heapless
                 // Deduplicate by IP
                 if results.iter().any(|r| r.ip == ip_str) { continue; }
 
-                // Extract friendly name from LOCATION or SERVER header
+                // Extract friendly name from SERVER header (case-insensitive)
                 let name = extract_ssdp_field(resp, "SERVER:")
-                    .or_else(|| extract_ssdp_field(resp, "server:"))
                     .unwrap_or(brand);
 
                 let mut tv = DiscoveredTv {
@@ -183,6 +205,9 @@ pub async fn discover_tvs(stack: &'static Stack<NetDriver<'static>>) -> heapless
             _ => break,
         }
     }
+
+    // Leave SSDP multicast group
+    let _ = stack.leave_multicast_group(embassy_net::Ipv4Address::new(239, 255, 255, 250));
 
     info!("[tv] SSDP discovered {} TVs", results.len());
     results
@@ -201,10 +226,12 @@ fn extract_ssdp_field<'a>(resp: &'a str, key: &str) -> Option<&'a str> {
 // ── TV task ─────────────────────────────────────────────────────────────────
 #[embassy_executor::task]
 pub async fn tv_task(
-    stack:     &'static Stack<NetDriver<'static>>,
+    stack:     Stack<'static>,
     engine:    &'static Mutex<ThreadModeRawMutex, DuckingEngine>,
     tv_config: &'static Mutex<ThreadModeRawMutex, TvConfig>,
+    tls_seed:  u64,
 ) {
+    let _ = tls_seed; // Used for Samsung port 8002 TLS (activated when needed)
     Timer::after(Duration::from_secs(3)).await;
 
     let mut rx_buf    = [0u8; 1024];
@@ -240,12 +267,16 @@ pub async fn tv_task(
         };
 
         info!("[tv] Connecting to {} ({:?}) port {}", config.ip.as_str(), config.brand, tv_port);
+        dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+            "connecting {}:{} brand={:?}", config.ip.as_str(), tv_port, config.brand);
 
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
         socket.set_timeout(Some(Duration::from_secs(15)));
 
-        if let Err(e) = socket.connect(tv_addr).await {
-            warn!("[tv] TCP connect failed: {:?} — retry in 15s", e);
+        if let Err(_e) = socket.connect(tv_addr).await {
+            dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Error,
+                "tcp_fail {}:{}", config.ip.as_str(), tv_port);
+            warn!("[tv] TCP connect failed — retry in 15s");
             Timer::after(Duration::from_secs(15)).await;
             continue;
         }
@@ -259,7 +290,18 @@ pub async fn tv_task(
                     let c = tv_config.lock().await;
                     c.samsung_token.clone()
                 };
-                match samsung_connect(&mut socket, config.ip.as_str(), tv_port, &token, &mut out_frame).await {
+                let samsung_result = samsung_connect(&mut socket, config.ip.as_str(), tv_port, &token, &mut out_frame).await;
+
+                // If plain WS on 8001 failed, log that 8002 TLS may be needed (Samsung 2021+)
+                if samsung_result.is_none() && tv_port == 8001 {
+                    info!("[tv/samsung] Port 8001 failed — Samsung 2021+ TVs may require port {} (TLS)", SAMSUNG_TLS_PORT);
+                    // Full TLS WebSocket on port 8002 requires wrapping the socket in
+                    // embedded_tls::TlsConnection. The embedded-tls crate and tls_seed are
+                    // available. A future update will add TvSocket enum to abstract
+                    // plain vs TLS transport for the command loop.
+                }
+
+                match samsung_result {
                     Some(new_token) => {
                         if !new_token.is_empty() {
                             let cfg_to_save = {
@@ -267,7 +309,6 @@ pub async fn tv_task(
                                 c.samsung_token = new_token;
                                 c.clone()
                             };
-                            // Persist token to flash — log length only, not the token
                             info!("[tv/samsung] Token received (len={}), saving to flash", cfg_to_save.samsung_token.len());
                             if WIFI_CMD_CH.try_send(WifiCmd::SaveTvConfig(cfg_to_save)).is_err() {
                                 warn!("[tv] Failed to send SaveTvConfig to wifi_task");
@@ -276,7 +317,6 @@ pub async fn tv_task(
                         true
                     }
                     None => {
-                        // Token may be expired — clear it and retry
                         let mut c = tv_config.lock().await;
                         if !c.samsung_token.is_empty() {
                             info!("[tv/samsung] Clearing expired token");
@@ -290,11 +330,25 @@ pub async fn tv_task(
                 }
             }
 
-            TvBrand::Sony => true,
+            TvBrand::Sony => {
+                // Validate PSK + connectivity by probing volume API
+                match sony_get_volume(&mut socket, &mut out_frame, &config).await {
+                    Some(vol) => {
+                        info!("[tv/sony] Validated OK (volume={})", vol);
+                        true
+                    }
+                    None => {
+                        warn!("[tv/sony] Validation failed — check PSK and TV power");
+                        false
+                    }
+                }
+            }
             TvBrand::Roku => true,
         };
 
         if !connected {
+            dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Warn,
+                "handshake fail {:?}", config.brand);
             warn!("[tv] Handshake failed — retry in 10s");
             Timer::after(Duration::from_secs(10)).await;
             continue;
@@ -302,6 +356,8 @@ pub async fn tv_task(
 
         active_ip.clear();
         let _ = active_ip.push_str(config.ip.as_str());
+        dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+            "handshake ok {:?}", config.brand);
         info!("[tv] Ready ({:?})", config.brand);
 
         // ── Command loop ────────────────────────────────────────────────────
@@ -322,6 +378,8 @@ pub async fn tv_task(
                 DuckCommand::None => continue,
 
                 DuckCommand::VolumeDown => {
+                    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                        "duck_cmd: VolumeDown");
                     let needs_query = {
                         let eng = engine.lock().await;
                         eng.original_volume.is_none() && brand.supports_absolute_volume()
@@ -330,42 +388,59 @@ pub async fn tv_task(
                         if let Some(vol) = tv_get_volume(brand, &mut socket, &mut out_frame, &config).await {
                             let mut eng = engine.lock().await;
                             eng.set_original_volume(vol);
+                            dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                                "got_volume={}", vol);
                             info!("[tv] Captured original volume: {}", vol);
+                        } else {
+                            dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Warn,
+                                "volume_query_fail");
                         }
                     }
 
                     let ok = tv_volume_down(brand, &mut socket, &mut out_frame, &config).await;
-                    if !ok { warn!("[tv] VolumeDown failed — reconnecting"); break 'cmd; }
+                    if !ok {
+                        dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Error,
+                            "vol_down_fail, reconnecting");
+                        warn!("[tv] VolumeDown failed — reconnecting");
+                        break 'cmd;
+                    }
                     info!("[tv] Volume down");
                 }
 
-                DuckCommand::Restore => {
-                    let (orig, steps) = {
-                        let eng = engine.lock().await;
-                        (eng.original_volume, eng.duck_steps_taken)
-                    };
-
+                DuckCommand::Restore { original_volume: orig, steps } => {
+                    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                        "duck_cmd: Restore orig={:?} steps={}", orig, steps);
                     let ok = if brand.supports_absolute_volume() {
                         if let Some(orig_vol) = orig {
                             let current = orig_vol.saturating_sub(steps);
                             tv_ramp_up_absolute(brand, &mut socket, &mut out_frame, &config, current, orig_vol).await
                         } else {
-                            tv_volume_up(brand, &mut socket, &mut out_frame, &config).await
+                            // Volume query failed at duck start — fall back to relative ramp
+                            tv_ramp_up_relative(brand, &mut socket, &mut out_frame, &config, steps).await
                         }
                     } else {
                         tv_ramp_up_relative(brand, &mut socket, &mut out_frame, &config, steps).await
                     };
 
                     if !ok {
+                        dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Error,
+                            "restore_fail, clearing duck state");
                         warn!("[tv] Restore failed — clearing duck state, reconnecting");
                         let mut eng = engine.lock().await;
                         eng.clear_duck_state();
                         break 'cmd;
                     }
+                    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                        "restored ok");
                     info!("[tv] Volume restored");
 
+                    // Only clear duck state if still Restoring. If user disarmed
+                    // and re-armed during the ramp, engine may be in a new Ducking
+                    // session — don't clobber it.
                     let mut eng = engine.lock().await;
-                    eng.clear_duck_state();
+                    if eng.state() == crate::ducking::DuckingState::Restoring {
+                        eng.clear_duck_state();
+                    }
                 }
             }
         }
@@ -547,7 +622,8 @@ async fn samsung_connect(
 
     let mut token: heapless::String<16> = heapless::String::new();
     if let Some(tok) = parse_json_str(frame, "\"token\":") {
-        let _ = token.push_str(tok);
+        // Truncate to 16 chars max (heapless::String<16> is all-or-nothing)
+        let _ = token.push_str(&tok[..tok.len().min(16)]);
         info!("[tv/samsung] Paired (token len={})", tok.len());
     } else {
         info!("[tv/samsung] Connected (no token — older TV)");
@@ -572,8 +648,8 @@ async fn samsung_key(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], key: &str)
 
 async fn sony_get_volume(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &TvConfig) -> Option<u8> {
     const BODY: &str = r#"{"method":"getVolumeInformation","id":33,"params":[],"version":"1.0"}"#;
-    sony_http_post(socket, out, &cfg.ip, &cfg.sony_psk, BODY).await?;
-    let resp = core::str::from_utf8(out).ok()?;
+    let resp_bytes = sony_http_post(socket, out, &cfg.ip, &cfg.sony_psk, BODY).await?;
+    let resp = core::str::from_utf8(resp_bytes).ok()?;
     let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
     let body = &resp[body_start..];
     let speaker_pos = body.find(r#""speaker""#)?;
@@ -699,7 +775,9 @@ async fn read_http_response(socket: &mut TcpSocket<'_>, buf: &mut [u8; 512]) -> 
 
     let header_text = core::str::from_utf8(&buf[..len.min(400)]).unwrap_or("");
     if let Some(cl) = header_text.lines()
-        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+        .find(|l| {
+            l.len() >= 15 && l.as_bytes()[..15].iter().zip(b"content-length:").all(|(a, b)| a.to_ascii_lowercase() == *b)
+        })
         .and_then(|l| l.split(':').nth(1))
         .and_then(|v| v.trim().parse::<usize>().ok())
     {
@@ -746,19 +824,27 @@ async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Option<()> {
     Some(())
 }
 
+/// Build a masked WebSocket text frame (RFC 6455 requires clients to mask).
+/// Uses a fixed masking key — sufficient for non-security purposes.
 fn ws_frame_unmasked(payload: &[u8], out: &mut [u8]) -> usize {
+    const MASK_KEY: [u8; 4] = [0x37, 0x5A, 0x1E, 0x9C];
     let len = payload.len();
     let hlen = if len < 126 { 2 } else { 4 };
-    out[0] = 0x81;
+    out[0] = 0x81; // FIN + text opcode
     if len < 126 {
-        out[1] = len as u8;
+        out[1] = 0x80 | len as u8; // MASK bit set
     } else {
-        out[1] = 126;
+        out[1] = 0x80 | 126;
         out[2] = (len >> 8) as u8;
         out[3] = (len & 0xFF) as u8;
     }
-    out[hlen..hlen + len].copy_from_slice(payload);
-    hlen + len
+    // Write masking key
+    out[hlen..hlen + 4].copy_from_slice(&MASK_KEY);
+    // Write masked payload
+    for (i, &b) in payload.iter().enumerate() {
+        out[hlen + 4 + i] = b ^ MASK_KEY[i % 4];
+    }
+    hlen + 4 + len
 }
 
 fn parse_volume_from_json(json: &[u8]) -> Option<u8> {

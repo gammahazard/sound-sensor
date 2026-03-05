@@ -1,18 +1,19 @@
 //! meter.rs — Real-time dB bar meter screen (Leptos)
 
-use leptos::*;
+use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 use crate::EventEntry;
 
-const DB_MIN: f32 = -60.0;
-const DB_MAX: f32 =   0.0;
+const DB_MIN: f32 = -50.0;
+const DB_MAX: f32 = -10.0;
 
 fn db_to_pct(db: f32) -> f32 {
     ((db - DB_MIN) / (DB_MAX - DB_MIN) * 100.0).clamp(0.0, 100.0)
 }
 
 fn bar_color(db: f32) -> &'static str {
-    if db > -10.0       { "#ef4444" }
-    else if db > -25.0  { "#eab308" }
+    if db > -18.0       { "#ef4444" }
+    else if db > -30.0  { "#eab308" }
     else                { "#22c55e" }
 }
 
@@ -27,22 +28,22 @@ pub fn MeterScreen(
     events:        ReadSignal<Vec<EventEntry>>,
     on_arm_toggle: impl Fn() + 'static,
 ) -> impl IntoView {
-    let on_arm_toggle = store_value(on_arm_toggle);
+    let on_arm_toggle = StoredValue::new_local(on_arm_toggle);
 
     // Peak hold (2 seconds)
-    let (peak, set_peak)            = create_signal(DB_MIN);
-    let peak_timer: StoredValue<Option<i32>> = store_value(None);
+    let (peak, set_peak)            = signal(DB_MIN);
+    let peak_timer: StoredValue<Option<i32>> = StoredValue::new(None);
 
-    create_effect(move |_| {
+    Effect::new(move || {
         let current = db.get();
         if current > peak.get_untracked() {
-            set_peak(current);
+            set_peak.set(current);
             if let Some(id) = peak_timer.get_value() {
                 web_sys::window().unwrap().clear_timeout_with_handle(id);
             }
             let set_peak_clone = set_peak.clone();
             let cb = wasm_bindgen::closure::Closure::once_into_js(move || {
-                set_peak_clone(DB_MIN);
+                set_peak_clone.set(DB_MIN);
             });
             let id = web_sys::window()
                 .unwrap()
@@ -50,7 +51,7 @@ pub fn MeterScreen(
                     cb.as_ref().unchecked_ref(), 2000,
                 )
                 .unwrap_or(0);
-            peak_timer.set_value(Some(id));
+            *peak_timer.write_value() = Some(id);
         }
     });
 
@@ -102,9 +103,9 @@ pub fn MeterScreen(
             // Scale labels
             <div style="display:flex;justify-content:space-between;font-size:11px;\
                         color:#475569;margin:-8px 8px 0">
-                <span>"-60 dB"</span>
+                <span>"-50 dB"</span>
                 <span>"-30 dB"</span>
-                <span>"0 dB"</span>
+                <span>"-10 dB"</span>
             </div>
 
             // ── Status row ──────────────────────────────────────────────────
@@ -142,7 +143,7 @@ pub fn MeterScreen(
 
             // ── Arm / Disarm button ─────────────────────────────────────────
             <button
-                on:click=move |_| on_arm_toggle.get_value()()
+                on:click=move |_| on_arm_toggle.with_value(|f| f())
                 style=move || format!(
                     "width:100%;padding:16px;border-radius:16px;border:none;\
                      font-size:18px;font-weight:700;cursor:pointer;\
@@ -156,7 +157,7 @@ pub fn MeterScreen(
             // ── Recent events ───────────────────────────────────────────────
             {move || {
                 let evts = events.get();
-                if evts.is_empty() { return ().into_view(); }
+                if evts.is_empty() { return ().into_any(); }
                 view! {
                     <div style="background:#1e293b;border-radius:16px;padding:12px;\
                                 display:flex;flex-direction:column;gap:4px">
@@ -173,10 +174,69 @@ pub fn MeterScreen(
                             }
                         }).collect_view()}
                     </div>
-                }.into_view()
+                }.into_any()
             }}
 
         </div>
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn db_to_pct_min() {
+        assert_eq!(db_to_pct(-50.0), 0.0);
+    }
+
+    #[test]
+    fn db_to_pct_max() {
+        assert_eq!(db_to_pct(-10.0), 100.0);
+    }
+
+    #[test]
+    fn db_to_pct_mid() {
+        assert_eq!(db_to_pct(-30.0), 50.0);
+    }
+
+    #[test]
+    fn db_to_pct_clamp_below() {
+        assert_eq!(db_to_pct(-100.0), 0.0);
+    }
+
+    #[test]
+    fn db_to_pct_clamp_above() {
+        assert_eq!(db_to_pct(0.0), 100.0);
+    }
+
+    #[test]
+    fn bar_color_green() {
+        assert_eq!(bar_color(-35.0), "#22c55e");
+    }
+
+    #[test]
+    fn bar_color_yellow() {
+        assert_eq!(bar_color(-25.0), "#eab308");
+    }
+
+    #[test]
+    fn bar_color_red() {
+        assert_eq!(bar_color(-15.0), "#ef4444");
+    }
+
+    #[test]
+    fn bar_color_boundary_yellow() {
+        // Exactly -30 should be green (not > -30)
+        assert_eq!(bar_color(-30.0), "#22c55e");
+    }
+
+    #[test]
+    fn bar_color_boundary_red() {
+        // Exactly -18 should be yellow (not > -18)
+        assert_eq!(bar_color(-18.0), "#eab308");
     }
 }
 

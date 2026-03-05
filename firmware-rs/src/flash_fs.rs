@@ -30,12 +30,23 @@ const DIR_MAGIC:    u32   = 0xF511_F511;
 const MAX_ENTRIES:  usize = 16;
 const ENTRY_SIZE:   usize = 64;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct DirEntry {
     magic:  u32,
     name:   [u8; 48],
     offset: u32,
     size:   u32,
+}
+
+impl Default for DirEntry {
+    fn default() -> Self {
+        Self {
+            magic: 0,
+            name: [0u8; 48],
+            offset: 0,
+            size: 0,
+        }
+    }
 }
 
 impl DirEntry {
@@ -82,6 +93,21 @@ impl FlashFs {
             n_files: 0,
             write_ptr: DATA_START,
         }
+    }
+
+    /// Borrow the underlying flash for direct operations (credential read/write).
+    pub fn flash_mut(&mut self) -> &mut Flash<'static, FLASH, Blocking, FLASH_SIZE> {
+        &mut self.flash
+    }
+
+    /// Look up a file in the in-memory directory (after alloc, before commit).
+    pub fn find_in_dir(&self, name: &str) -> (u32, u32) {
+        for e in &self.dir[..self.n_files] {
+            if e.is_valid() && e.filename() == name {
+                return (e.offset, e.size);
+            }
+        }
+        (0, 0)
     }
 
     fn read_dir_raw(&mut self) -> [DirEntry; MAX_ENTRIES] {
@@ -137,8 +163,9 @@ impl FlashFs {
     }
 
     pub fn alloc_file(&mut self, name: &str, size: u32) -> Option<u32> {
+        if size == 0 { return None; }
         if self.n_files >= MAX_ENTRIES { return None; }
-        let aligned = align4(size as usize) as u32;
+        let aligned = align256(size as usize) as u32;
         if self.write_ptr + aligned > PART_END { return None; }
 
         let offset = self.write_ptr;
@@ -160,10 +187,19 @@ impl FlashFs {
     }
 
     pub fn write_chunk(&mut self, offset: u32, data: &[u8]) -> bool {
+        if offset < DATA_START || (offset as usize).saturating_add(data.len()) > PART_END as usize {
+            return false;
+        }
         self.flash.blocking_write(offset, data).is_ok()
     }
 
     pub fn commit_dir(&mut self) -> bool {
+        // Erase directory sector first — flash can only flip 1→0 bits.
+        // Without this, a second commit would corrupt the directory.
+        if self.flash.blocking_erase(DIR_OFFSET, DIR_OFFSET + SECTOR_SIZE).is_err() {
+            warn!("[fs] Directory erase failed");
+            return false;
+        }
         let mut raw = [0u8; MAX_ENTRIES * ENTRY_SIZE];
         for (i, e) in self.dir[..self.n_files].iter().enumerate() {
             let b = entry_to_bytes(e);
@@ -179,7 +215,8 @@ impl FlashFs {
     }
 }
 
-fn align4(n: usize) -> usize { (n + 3) & !3 }
+/// Align to 256-byte flash page boundary (required for RP2350 flash writes).
+fn align256(n: usize) -> usize { (n + 255) & !255 }
 
 // ── OTA file offset table (wifi_task → http_task) ────────────────────────────
 
@@ -190,6 +227,22 @@ use embassy_sync::{
 
 pub static OTA_FILE_OFFSETS: Mutex<ThreadModeRawMutex, OtaFileTable> =
     Mutex::new(OtaFileTable::new());
+
+/// Read a chunk from flash at the given absolute offset.
+/// Safe to call from any task — uses a separate blocking flash read via raw pointer.
+/// This is safe because flash reads are atomic at the hardware level on RP2350.
+pub fn flash_read_chunk(offset: u32, buf: &mut [u8]) -> bool {
+    // Bounds check: offset + len must stay within flash partition
+    if offset < PART_START || (offset as usize).saturating_add(buf.len()) > PART_END as usize {
+        return false;
+    }
+    // Direct flash read via memory-mapped XIP (flash is at 0x10000000)
+    let src = (0x1000_0000 + offset as usize) as *const u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len());
+    }
+    true
+}
 
 #[derive(Clone, Copy)]
 pub struct OtaFileTable {

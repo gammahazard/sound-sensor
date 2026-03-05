@@ -35,7 +35,9 @@ use embassy_time::Instant;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DuckCommand {
     VolumeDown,
-    Restore,
+    /// Restore TV volume. Carries the saved restore parameters so tv_task
+    /// doesn't need to re-read the engine (avoids race on disarm).
+    Restore { original_volume: Option<u8>, steps: u8 },
     None,
 }
 
@@ -50,6 +52,11 @@ pub enum DuckingState {
 /// Minimum seconds after the last VolumeDown before restore via Path B.
 /// Prevents duck/restore oscillation when the sensor hears its own ducked output.
 const RESTORE_HOLD_SECS: u64 = 30;
+
+/// Maximum VolumeDown steps before we stop counting.
+/// Prevents Samsung/Roku restore overshoot (they use relative key presses,
+/// so phantom steps at volume 0 would cause too many VolumeUp presses).
+const MAX_DUCK_STEPS: u8 = 30;
 
 pub struct DuckingEngine {
     pub tripwire_db:  f32,
@@ -87,11 +94,19 @@ impl DuckingEngine {
     /// Call every 100 ms with the latest dBFS reading.
     /// Returns what action (if any) the TV task should take.
     pub fn tick(&mut self, db: f32) -> DuckCommand {
+        if db.is_nan() {
+            return DuckCommand::None;
+        }
         if !self.armed {
             self.sustained_ms = 0;
             self.state = DuckingState::Quiet;
             return DuckCommand::None;
         }
+
+        #[allow(unused)]
+        let prev_state = self.state;
+        #[allow(unused)]
+        let prev_sustained = self.sustained_ms;
 
         // ── Accumulate / decay ──────────────────────────────────────────────
         if db > self.tripwire_db {
@@ -100,14 +115,32 @@ impl DuckingEngine {
             self.sustained_ms = self.sustained_ms.saturating_sub(50);
         }
 
+        // Log sustained_ms milestones (1s, 2s, 3s crossings)
+        #[cfg(feature = "dev-mode")]
+        {
+            use crate::dev_log::{LogCat, LogLevel};
+            for &ms in &[1000u32, 2000, 3000] {
+                if prev_sustained < ms && self.sustained_ms >= ms {
+                    dev_log!(LogCat::Ducking, LogLevel::Info,
+                        "sustained={}ms db={:.1}", ms, db);
+                }
+            }
+        }
+
         // ── Restore checks (only while actively ducking) ────────────────────
         if self.state == DuckingState::Ducking {
             // Path A: Room is near-silent → restore immediately.
             // Handles: TV turned off, commercial break, user muted TV, etc.
             if db < self.floor_db + 2.0 {
+                dev_log!(crate::dev_log::LogCat::Ducking, crate::dev_log::LogLevel::Info,
+                    "restore_A: db={:.1} < floor+2={:.1}", db, self.floor_db + 2.0);
+                let cmd = DuckCommand::Restore {
+                    original_volume: self.original_volume,
+                    steps: self.duck_steps_taken,
+                };
                 self.state = DuckingState::Restoring;
                 self.sustained_ms = 0;
-                return DuckCommand::Restore;
+                return cmd;
             }
 
             // Path B: Noise has been below tripwire long enough for sustained_ms
@@ -119,8 +152,14 @@ impl DuckingEngine {
                     None => true,
                 };
                 if hold_elapsed {
+                    dev_log!(crate::dev_log::LogCat::Ducking, crate::dev_log::LogLevel::Info,
+                        "restore_B: hold_elapsed steps={}", self.duck_steps_taken);
+                    let cmd = DuckCommand::Restore {
+                        original_volume: self.original_volume,
+                        steps: self.duck_steps_taken,
+                    };
                     self.state = DuckingState::Restoring;
-                    return DuckCommand::Restore;
+                    return cmd;
                 }
                 // Hold not elapsed yet — stay in Ducking state, wait.
             }
@@ -133,10 +172,14 @@ impl DuckingEngine {
         }
 
         // ── Ducking trigger ─────────────────────────────────────────────────
-        if self.sustained_ms >= 3000 {
+        // Skip if Restoring — tv_task is ramping volume back up; re-entering
+        // Ducking would send VolumeDown while the ramp is still running.
+        if self.sustained_ms >= 3000 && self.state != DuckingState::Restoring {
             self.state = DuckingState::Ducking;
 
             let excess = db - self.tripwire_db;
+            #[allow(unused)]
+            let prev_interval = self.duck_interval_ms;
             self.duck_interval_ms = if excess > 15.0 {
                 500     // crisis: baby may wake fast, drop volume quickly
             } else if excess < 5.0 {
@@ -144,6 +187,19 @@ impl DuckingEngine {
             } else {
                 1000    // standard: moderate excess
             };
+
+            // Log rate tier changes
+            #[cfg(feature = "dev-mode")]
+            if prev_interval != self.duck_interval_ms {
+                use crate::dev_log::{LogCat, LogLevel};
+                let tier = match self.duck_interval_ms {
+                    500  => "crisis",
+                    2000 => "gentle",
+                    _    => "standard",
+                };
+                dev_log!(LogCat::Ducking, LogLevel::Info,
+                    "rate: {}({}ms) excess={:.1}dB", tier, self.duck_interval_ms, excess);
+            }
 
             let now = Instant::now();
             let should_duck = match self.last_duck_at {
@@ -156,11 +212,34 @@ impl DuckingEngine {
 
             if should_duck {
                 self.last_duck_at = Some(now);
-                self.duck_steps_taken = self.duck_steps_taken.saturating_add(1);
-                return DuckCommand::VolumeDown;
+                if self.duck_steps_taken >= MAX_DUCK_STEPS {
+                    // Stop ducking further — TV is likely at 0.
+                    // Prevents Samsung/Roku overshoot on restore.
+                    dev_log!(crate::dev_log::LogCat::Ducking, crate::dev_log::LogLevel::Info,
+                        "vol_down CAPPED at {} steps", MAX_DUCK_STEPS);
+                } else {
+                    self.duck_steps_taken += 1;
+                    dev_log!(crate::dev_log::LogCat::Ducking, crate::dev_log::LogLevel::Info,
+                        "vol_down step={} interval={}ms", self.duck_steps_taken, self.duck_interval_ms);
+                    return DuckCommand::VolumeDown;
+                }
             }
-        } else if self.sustained_ms > 0 {
+        } else if self.sustained_ms > 0 && self.state != DuckingState::Ducking && self.state != DuckingState::Restoring {
             self.state = DuckingState::Watching;
+        }
+
+        // Log state transitions
+        #[cfg(feature = "dev-mode")]
+        if self.state != prev_state {
+            use crate::dev_log::{LogCat, LogLevel};
+            let s = |st: DuckingState| match st {
+                DuckingState::Quiet     => "quiet",
+                DuckingState::Watching  => "watching",
+                DuckingState::Ducking   => "ducking",
+                DuckingState::Restoring => "restoring",
+            };
+            dev_log!(LogCat::Ducking, LogLevel::Info,
+                "{}->{} db={:.1}", s(prev_state), s(self.state), db);
         }
 
         DuckCommand::None
@@ -179,32 +258,113 @@ impl DuckingEngine {
         self.duck_steps_taken = 0;
         self.original_volume = None;
         self.last_duck_at = None;
+        self.state = DuckingState::Quiet;
     }
 
     /// Set tripwire with validation: must be at least floor + 6 dB.
     /// Prevents false-positive ducking from trivially small gaps.
     pub fn set_tripwire(&mut self, db: f32) {
         let min = self.floor_db + 6.0;
+        if db < min {
+            dev_log!(crate::dev_log::LogCat::Ducking, crate::dev_log::LogLevel::Warn,
+                "tripwire {:.1} < floor+6={:.1}, clamped", db, min);
+        }
         self.tripwire_db = if db < min { min } else { db };
     }
 
     /// Set floor with validation: reject < -80 dB (dead mic), clamp to -60.
     /// Re-clamp tripwire if floor changed so tripwire >= floor + 6.
     pub fn set_floor(&mut self, db: f32) {
+        if db < -80.0 {
+            dev_log!(crate::dev_log::LogCat::Ducking, crate::dev_log::LogLevel::Warn,
+                "floor {:.1} < -80dB (dead mic?), clamped to -60", db);
+        }
         let db = if db < -80.0 { -60.0 } else { db };
         self.floor_db = db;
         // Ensure tripwire is at least floor + 6 dB
         if self.tripwire_db < self.floor_db + 6.0 {
+            dev_log!(crate::dev_log::LogCat::Ducking, crate::dev_log::LogLevel::Info,
+                "tripwire bumped {:.1}->{:.1} (floor+6)", self.tripwire_db, self.floor_db + 6.0);
             self.tripwire_db = self.floor_db + 6.0;
         }
     }
 
     pub fn arm(&mut self)   { self.armed = true; }
-    pub fn disarm(&mut self) {
+    /// Returns a Restore command with captured params if actively ducking, else None.
+    pub fn disarm(&mut self) -> DuckCommand {
+        let cmd = if self.state == DuckingState::Ducking {
+            DuckCommand::Restore {
+                original_volume: self.original_volume,
+                steps: self.duck_steps_taken,
+            }
+        } else {
+            DuckCommand::None
+        };
         self.armed = false;
         self.sustained_ms = 0;
+        self.state = DuckingState::Quiet;
         self.clear_duck_state();
+        cmd
     }
     pub fn state(&self) -> DuckingState     { self.state }
     pub fn sustained_ms(&self) -> u32       { self.sustained_ms }
+}
+
+// ── Ducking task (always runs, independent of WebSocket) ─────────────────────
+
+use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, mutex::Mutex};
+
+/// Ducking tick task: consumes audio dB readings and drives the ducking engine.
+/// Runs independently of any WebSocket client — baby protection works even
+/// with the browser closed or WiFi momentarily down.
+#[embassy_executor::task]
+pub async fn ducking_task(
+    engine: &'static Mutex<ThreadModeRawMutex, DuckingEngine>,
+) {
+    let mut prev_led = crate::LedPattern::Idle;
+
+    loop {
+        let db = crate::DB_CHANNEL.receive().await;
+
+        // Tick the ducking engine
+        let (duck_cmd, armed, tripwire, ducking) = {
+            let mut eng = engine.lock().await;
+            let cmd = eng.tick(db);
+            let ducking = eng.state() == DuckingState::Ducking;
+            (cmd, eng.armed, eng.tripwire_db, ducking)
+        };
+
+        // Update LED pattern ONLY when state changes (prevents led_step reset spam)
+        let new_led = if ducking {
+            crate::LedPattern::Ducking
+        } else if armed {
+            crate::LedPattern::Armed
+        } else {
+            crate::LedPattern::Idle
+        };
+        if new_led != prev_led {
+            if crate::LED_CHANNEL.try_send(new_led).is_err() {
+                dev_log!(crate::dev_log::LogCat::Ducking, crate::dev_log::LogLevel::Warn,
+                    "LED_CHANNEL full");
+            }
+            prev_led = new_led;
+        }
+
+        // Dispatch duck commands to TV task
+        if duck_cmd != DuckCommand::None {
+            crate::tv::send_duck_command(duck_cmd).await;
+        }
+
+        // Update shared telemetry snapshot for ws.rs to read
+        {
+            let mut t = crate::TELEMETRY.lock().await;
+            t.db = db;
+            t.armed = armed;
+            t.tripwire = tripwire;
+            t.ducking = ducking;
+        }
+
+        // Notify ws.rs that new telemetry is available (non-blocking)
+        let _ = crate::TELEM_SIGNAL.try_send(());
+    }
 }

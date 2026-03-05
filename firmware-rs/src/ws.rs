@@ -13,30 +13,32 @@
 //!   arm, disarm, calibrate_silence, calibrate_max, threshold,
 //!   scan_wifi, set_wifi, set_tv, discover_tvs, ota_check
 
+use core::fmt::Write;
 use defmt::*;
+use embedded_io_async::Write as _;
 use embassy_futures::select::{select, Either};
 use embassy_net::Stack;
-use embassy_net::TcpSocket;
+use embassy_net::tcp::TcpSocket;
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Timer};
-use cyw43_pio::NetDriver;
 
 use crate::{
-    DB_CHANNEL, LED_CHANNEL, WIFI_CMD_CH, WIFI_EVT_CH,
+    TELEM_SIGNAL, TELEMETRY, LED_CHANNEL, WIFI_CMD_CH, WIFI_EVT_CH,
     LedPattern, WifiCmd, WifiEvent,
-    ducking::{DuckCommand, DuckingEngine, DuckingState},
+    ducking::{DuckCommand, DuckingEngine},
     tv::{TvBrand, TvConfig},
 };
 
 const TCP_PORT: u16   = 81;
 const TX_BUF:   usize = 1024;
-const RX_BUF:   usize = 512;
+const RX_BUF:   usize = 768;
 
 #[embassy_executor::task]
 pub async fn websocket_task(
-    stack:     &'static Stack<NetDriver<'static>>,
+    stack:     Stack<'static>,
     engine:    &'static Mutex<ThreadModeRawMutex, DuckingEngine>,
     tv_config: &'static Mutex<ThreadModeRawMutex, TvConfig>,
+    tls_seed:  u64,
 ) {
     let mut rx_buf = [0u8; RX_BUF];
     let mut tx_buf = [0u8; TX_BUF];
@@ -46,8 +48,8 @@ pub async fn websocket_task(
         socket.set_timeout(Some(Duration::from_secs(60)));
 
         info!("[ws] Waiting for connection on port {}", TCP_PORT);
-        if let Err(e) = socket.accept(TCP_PORT).await {
-            warn!("[ws] Accept error: {:?}", e);
+        if let Err(_e) = socket.accept(TCP_PORT).await {
+            warn!("[ws] Accept error");
             Timer::after(Duration::from_millis(100)).await;
             continue;
         }
@@ -58,7 +60,7 @@ pub async fn websocket_task(
             continue;
         }
 
-        handle_client(socket, stack, engine, tv_config).await;
+        handle_client(socket, stack, engine, tv_config, tls_seed).await;
         info!("[ws] Client disconnected");
     }
 }
@@ -66,7 +68,7 @@ pub async fn websocket_task(
 // ── Handshake ─────────────────────────────────────────────────────────────
 
 async fn ws_handshake(socket: &mut TcpSocket<'_>) -> bool {
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 768];
     let mut len = 0;
     loop {
         match socket.read(&mut buf[len..]).await {
@@ -82,7 +84,9 @@ async fn ws_handshake(socket: &mut TcpSocket<'_>) -> bool {
     let request = core::str::from_utf8(&buf[..len]).unwrap_or("");
     let key = request
         .lines()
-        .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key"))
+        .find(|l| {
+            l.len() >= 17 && l.as_bytes()[..17].iter().zip(b"sec-websocket-key").all(|(a, b)| a.to_ascii_lowercase() == *b)
+        })
         .and_then(|l| l.split(':').nth(1))
         .map(|k| k.trim());
 
@@ -103,41 +107,34 @@ async fn ws_handshake(socket: &mut TcpSocket<'_>) -> bool {
 
 async fn handle_client(
     mut socket: TcpSocket<'_>,
-    stack: &'static Stack<NetDriver<'static>>,
+    stack: Stack<'static>,
     engine:    &'static Mutex<ThreadModeRawMutex, DuckingEngine>,
     tv_config: &'static Mutex<ThreadModeRawMutex, TvConfig>,
+    tls_seed:  u64,
 ) {
     let mut out_frame = [0u8; 1100];
-    let mut last_db = -60.0f32;
 
     loop {
         let mut rx_buf = [0u8; 384];
 
-        match select(DB_CHANNEL.receive(), socket.read(&mut rx_buf)).await {
+        // Nested select: wait for (telemetry OR 500ms timer) vs socket data.
+        // The 500ms timer ensures WiFi events (scan results) get forwarded even
+        // when no audio telemetry is flowing (e.g. mic not connected, AP mode setup).
+        let telem_or_tick = select(
+            TELEM_SIGNAL.receive(),
+            Timer::after(Duration::from_millis(500)),
+        );
 
-            Either::First(db) => {
-                last_db = db;
+        match select(telem_or_tick, socket.read(&mut rx_buf)).await {
 
-                // Tick ducking engine
-                let (duck_cmd, armed, tripwire, ducking) = {
-                    let mut eng = engine.lock().await;
-                    let cmd = eng.tick(db);
-                    let ducking = eng.state() == DuckingState::Ducking;
-                    (cmd, eng.armed, eng.tripwire_db, ducking)
+            Either::First(_) => {
+                // Read latest telemetry snapshot (written by ducking_task)
+                let (db, armed, tripwire, ducking) = {
+                    let t = TELEMETRY.lock().await;
+                    (t.db, t.armed, t.tripwire, t.ducking)
                 };
 
-                // Update LED pattern based on state
-                if ducking {
-                    let _ = LED_CHANNEL.try_send(LedPattern::Ducking);
-                } else if armed {
-                    let _ = LED_CHANNEL.try_send(LedPattern::Armed);
-                }
-
-                if duck_cmd != DuckCommand::None {
-                    crate::tv::send_duck_command(duck_cmd).await;
-                }
-
-                // Check for WiFi scan results to forward
+                // Check for WiFi events to forward
                 if let Ok(evt) = WIFI_EVT_CH.try_receive() {
                     match evt {
                         WifiEvent::ScanResults(networks) => {
@@ -145,26 +142,76 @@ async fn handle_client(
                             let n = ws_text_frame(json.as_bytes(), &mut out_frame);
                             if socket.write_all(&out_frame[..n]).await.is_err() { break; }
                         }
+                        WifiEvent::OtaComplete { success, version } => {
+                            let mut json: heapless::String<256> = heapless::String::new();
+                            if success {
+                                let _ = core::write!(
+                                    json,
+                                    r#"{{"evt":"ota_done","pwa":"{}","fw":"{}"}}"#,
+                                    version.as_str(), crate::FW_VERSION,
+                                );
+                            } else {
+                                let _ = core::write!(
+                                    json,
+                                    r#"{{"evt":"ota_status","checking":false,"available":false,"current":"{}","latest":"{}","fw":"{}","error":true}}"#,
+                                    crate::PWA_VERSION, crate::PWA_VERSION, crate::FW_VERSION,
+                                );
+                            }
+                            let n = ws_text_frame(json.as_bytes(), &mut out_frame);
+                            let _ = socket.write_all(&out_frame[..n]).await;
+                        }
                     }
                 }
 
                 // Broadcast telemetry
-                let mut json: heapless::String<192> = heapless::String::new();
+                let mut json: heapless::String<224> = heapless::String::new();
                 let _ = core::write!(
                     json,
-                    r#"{{"db":{:.2},"armed":{},"tripwire":{:.2},"ducking":{},"fw":"{}","pwa":"{}"}}"#,
+                    r#"{{"db":{:.2},"armed":{},"tripwire":{:.2},"ducking":{},"fw":"{}","pwa":"{}""#,
                     db, armed, tripwire, ducking,
                     crate::FW_VERSION,
                     crate::PWA_VERSION,
                 );
+                #[cfg(feature = "dev-mode")]
+                { let _ = json.push_str(r#","dev":true"#); }
+                let _ = json.push('}');
                 let n = ws_text_frame(json.as_bytes(), &mut out_frame);
                 if socket.write_all(&out_frame[..n]).await.is_err() {
                     break;
                 }
+
+                // Drain dev-mode log entries and forward to client
+                #[cfg(feature = "dev-mode")]
+                {
+                    use crate::dev_log::{DEV_LOG_CH, DEV_LOG_ACTIVE};
+                    if DEV_LOG_ACTIVE.load(portable_atomic::Ordering::Relaxed) {
+                        while let Ok(entry) = DEV_LOG_CH.try_receive() {
+                            let mut log_json: heapless::String<256> = heapless::String::new();
+                            let _ = core::write!(
+                                log_json,
+                                r#"{{"evt":"log","cat":"{}","lvl":"{}","msg":""#,
+                                entry.cat.as_str(),
+                                entry.level.as_str(),
+                            );
+                            // Escape the message to prevent JSON breakage
+                            for &b in entry.msg.as_bytes() {
+                                match b {
+                                    b'"'  => { let _ = log_json.push_str("\\\""); }
+                                    b'\\' => { let _ = log_json.push_str("\\\\"); }
+                                    _ => { let _ = log_json.push(b as char); }
+                                }
+                            }
+                            let _ = log_json.push_str("\"}");
+                            let n = ws_text_frame(log_json.as_bytes(), &mut out_frame);
+                            if socket.write_all(&out_frame[..n]).await.is_err() { break; }
+                        }
+                    }
+                }
             }
 
             Either::Second(Ok(n)) if n > 0 => {
-                process_frame(&rx_buf[..n], stack, engine, tv_config, last_db, &mut socket, &mut out_frame).await;
+                let last_db = { TELEMETRY.lock().await.db };
+                process_frame(&rx_buf[..n], stack, engine, tv_config, last_db, &mut socket, &mut out_frame, tls_seed).await;
             }
 
             Either::Second(_) => break,
@@ -175,12 +222,13 @@ async fn handle_client(
 /// Unmask an incoming WS frame and dispatch the JSON payload.
 async fn process_frame(
     raw:       &[u8],
-    stack:     &'static Stack<NetDriver<'static>>,
+    stack:     Stack<'static>,
     engine:    &'static Mutex<ThreadModeRawMutex, DuckingEngine>,
     tv_config: &'static Mutex<ThreadModeRawMutex, TvConfig>,
     last_db:   f32,
     socket:    &mut TcpSocket<'_>,
     out_frame: &mut [u8; 1100],
+    tls_seed:  u64,
 ) {
     if raw.len() < 2 { return; }
     let masked  = (raw[1] & 0x80) != 0;
@@ -212,74 +260,102 @@ async fn process_frame(
         payload[..plen].copy_from_slice(&raw[hlen..hlen + plen]);
     }
 
-    apply_command(&payload[..plen], stack, engine, tv_config, last_db, socket, out_frame).await;
+    apply_command(&payload[..plen], stack, engine, tv_config, last_db, socket, out_frame, tls_seed).await;
 }
 
 async fn apply_command(
     payload:   &[u8],
-    stack:     &'static Stack<NetDriver<'static>>,
+    stack:     Stack<'static>,
     engine:    &'static Mutex<ThreadModeRawMutex, DuckingEngine>,
     tv_config: &'static Mutex<ThreadModeRawMutex, TvConfig>,
     last_db:   f32,
     socket:    &mut TcpSocket<'_>,
     out_frame: &mut [u8; 1100],
+    tls_seed: u64,
 ) {
     let Ok(s) = core::str::from_utf8(payload) else { return };
+    let cmd = parse_str_field(s, r#""cmd":"#);
 
-    if s.contains(r#""cmd":"arm""#) {
+    if cmd == Some("arm") {
         let mut eng = engine.lock().await;
         eng.arm();
         let _ = LED_CHANNEL.try_send(LedPattern::Armed);
         info!("[ws] Armed");
 
-    } else if s.contains(r#""cmd":"disarm""#) {
-        let mut eng = engine.lock().await;
-        eng.disarm();
+    } else if cmd == Some("disarm") {
+        let restore_cmd = {
+            let mut eng = engine.lock().await;
+            eng.disarm()
+        };
+        if let DuckCommand::Restore { .. } = restore_cmd {
+            crate::tv::send_duck_command(restore_cmd).await;
+            info!("[ws] Disarmed (restoring TV volume)");
+        } else {
+            info!("[ws] Disarmed");
+        }
         let _ = LED_CHANNEL.try_send(LedPattern::Idle);
-        info!("[ws] Disarmed");
 
-    } else if s.contains(r#""cmd":"calibrate_silence""#) {
+    } else if cmd == Some("calibrate_silence") {
         let db = parse_f32_field(s, r#""db":"#).unwrap_or(last_db);
-        let mut eng = engine.lock().await;
-        eng.set_floor(db);
+        let (floor, tripwire) = {
+            let mut eng = engine.lock().await;
+            eng.set_floor(db);
+            (eng.floor_db, eng.tripwire_db)
+        };
+        let _ = WIFI_CMD_CH.try_send(WifiCmd::SaveCalibration { floor, tripwire });
         info!("[ws] Floor set to {} dBFS", db);
 
-    } else if s.contains(r#""cmd":"calibrate_max""#) {
+    } else if cmd == Some("calibrate_max") {
         let db = parse_f32_field(s, r#""db":"#).unwrap_or(last_db);
         let tripwire = db - 3.0;
-        let mut eng = engine.lock().await;
-        eng.set_tripwire(tripwire);
+        let (floor, tripwire) = {
+            let mut eng = engine.lock().await;
+            eng.set_tripwire(tripwire);
+            (eng.floor_db, eng.tripwire_db)
+        };
+        let _ = WIFI_CMD_CH.try_send(WifiCmd::SaveCalibration { floor, tripwire });
         info!("[ws] Tripwire set to {} dBFS (TV at {})", tripwire, db);
 
-    } else if s.contains(r#""threshold":"#) {
+    } else if cmd == Some("threshold") || s.contains(r#""threshold":"#) {
         if let Some(v) = parse_f32_field(s, r#""threshold":"#) {
-            let mut eng = engine.lock().await;
-            eng.set_tripwire(v);
+            let (floor, tripwire) = {
+                let mut eng = engine.lock().await;
+                eng.set_tripwire(v);
+                (eng.floor_db, eng.tripwire_db)
+            };
+            let _ = WIFI_CMD_CH.try_send(WifiCmd::SaveCalibration { floor, tripwire });
             info!("[ws] Manual tripwire: {}", v);
         }
 
-    } else if s.contains(r#""cmd":"scan_wifi""#) {
+    } else if cmd == Some("scan_wifi") {
         info!("[ws] WiFi scan requested");
         let _ = WIFI_CMD_CH.try_send(WifiCmd::Scan);
 
-    } else if s.contains(r#""cmd":"set_wifi""#) {
-        let ssid = parse_str_field(s, r#""ssid":"#).unwrap_or("");
-        let pass = parse_str_field(s, r#""pass":"#).unwrap_or("");
-        info!("[ws] WiFi reconfigure → {}", ssid);
+    } else if cmd == Some("set_wifi") {
+        let raw_ssid = parse_str_field(s, r#""ssid":"#).unwrap_or("");
+        let raw_pass = parse_str_field(s, r#""pass":"#).unwrap_or("");
+        // Unescape JSON sequences: \" → " and \\ → \
+        let ssid_h: heapless::String<64> = json_unescape(raw_ssid);
+        let pass_h: heapless::String<64> = json_unescape(raw_pass);
+        info!("[ws] WiFi reconfigure → {}", ssid_h.as_str());
 
-        // Send wifi_reconfiguring event back to client
-        let mut evt: heapless::String<128> = heapless::String::new();
-        let _ = core::write!(evt, r#"{{"evt":"wifi_reconfiguring","ssid":"{}"}}"#, ssid);
+        // Send wifi_reconfiguring event back to client (JSON-escape the SSID)
+        let mut evt: heapless::String<256> = heapless::String::new();
+        let _ = evt.push_str(r#"{"evt":"wifi_reconfiguring","ssid":""#);
+        for &b in ssid_h.as_bytes() {
+            match b {
+                b'"'  => { let _ = evt.push_str("\\\""); }
+                b'\\' => { let _ = evt.push_str("\\\\"); }
+                _ => { let _ = evt.push(b as char); }
+            }
+        }
+        let _ = evt.push_str(r#""}"#);
         let n = ws_text_frame(evt.as_bytes(), out_frame);
         let _ = socket.write_all(&out_frame[..n]).await;
 
-        let mut ssid_h: heapless::String<64> = heapless::String::new();
-        let _ = ssid_h.push_str(ssid);
-        let mut pass_h: heapless::String<64> = heapless::String::new();
-        let _ = pass_h.push_str(pass);
-        let _ = WIFI_CMD_CH.try_send(WifiCmd::Reconfigure { ssid: ssid_h, pass: pass_h });
+        WIFI_CMD_CH.send(WifiCmd::Reconfigure { ssid: ssid_h, pass: pass_h }).await;
 
-    } else if s.contains(r#""cmd":"set_tv""#) {
+    } else if cmd == Some("set_tv") {
         let ip    = parse_str_field(s, r#""ip":"#);
         let brand = parse_str_field(s, r#""brand":"#).and_then(TvBrand::parse);
         let psk   = parse_str_field(s, r#""psk":"#);
@@ -310,8 +386,9 @@ async fn apply_command(
                     let _ = cfg.ip.push_str(ip_str);
                     cfg.brand = brand;
                     if let Some(p) = psk {
+                        let unescaped: heapless::String<16> = json_unescape(p);
                         cfg.sony_psk.clear();
-                        let _ = cfg.sony_psk.push_str(&p[..p.len().min(8)]);
+                        let _ = cfg.sony_psk.push_str(&unescaped.as_str()[..unescaped.len().min(8)]);
                     }
                     cfg.clone()
                 };
@@ -324,36 +401,75 @@ async fn apply_command(
             }
         }
 
-    } else if s.contains(r#""cmd":"discover_tvs""#) {
+    } else if cmd == Some("discover_tvs") {
         info!("[ws] TV discovery requested");
         let tvs = crate::tv::discover_tvs(stack).await;
         let json = format_discovered_tvs(&tvs);
         let n = ws_text_frame(json.as_bytes(), out_frame);
         let _ = socket.write_all(&out_frame[..n]).await;
 
-    } else if s.contains(r#""cmd":"ota_check""#) {
-        info!("[ws] OTA check requested");
-        let result = crate::ota::check_for_update().await;
-        let json = crate::ota::status_json(
-            false,
-            result.available,
-            result.current.as_str(),
-            result.latest.as_str(),
-            false,
-        );
-        let n = ws_text_frame(json.as_bytes(), out_frame);
-        let _ = socket.write_all(&out_frame[..n]).await;
+    } else if cmd == Some("ota_check") {
+        if crate::AP_MODE.load(portable_atomic::Ordering::Relaxed) {
+            warn!("[ws] OTA check ignored in AP mode");
+        } else {
+            info!("[ws] OTA check requested");
+            let result = crate::ota::check_for_update(
+                stack,
+                crate::ota::get_tcp_state(),
+                tls_seed,
+            ).await;
+            let json = crate::ota::status_json(
+                false,
+                result.available,
+                result.current.as_str(),
+                result.latest.as_str(),
+                false,
+            );
+            let n = ws_text_frame(json.as_bytes(), out_frame);
+            let _ = socket.write_all(&out_frame[..n]).await;
+        }
+
+    } else if cmd == Some("ota_download") {
+        if crate::AP_MODE.load(portable_atomic::Ordering::Relaxed) {
+            warn!("[ws] OTA download ignored in AP mode");
+        } else {
+            info!("[ws] OTA download requested");
+            let _ = WIFI_CMD_CH.try_send(WifiCmd::OtaDownload { tls_seed });
+        }
+
+    }
+
+    // Dev-mode toggle (only compiled with dev-mode feature)
+    #[cfg(feature = "dev-mode")]
+    if cmd == Some("dev_toggle") {
+        use crate::dev_log::DEV_LOG_ACTIVE;
+        let was = DEV_LOG_ACTIVE.load(portable_atomic::Ordering::Relaxed);
+        DEV_LOG_ACTIVE.store(!was, portable_atomic::Ordering::Relaxed);
+        info!("[ws] Dev logging toggled: {}", !was);
     }
 }
 
 // ── Event formatters ────────────────────────────────────────────────────────
+
+/// Append a JSON-escaped string to the output (escapes `"` and `\`).
+fn push_json_escaped(out: &mut heapless::String<1024>, s: &str) {
+    for &b in s.as_bytes() {
+        match b {
+            b'"'  => { let _ = out.push_str("\\\""); }
+            b'\\' => { let _ = out.push_str("\\\\"); }
+            _ => { let _ = out.push(b as char); }
+        }
+    }
+}
 
 fn format_wifi_scan(networks: &[crate::NetworkInfo]) -> heapless::String<1024> {
     let mut s: heapless::String<1024> = heapless::String::new();
     let _ = s.push_str(r#"{"evt":"wifi_scan","networks":["#);
     for (i, net) in networks.iter().enumerate() {
         if i > 0 { let _ = s.push(','); }
-        let _ = core::write!(s, r#"{{"ssid":"{}","rssi":{}}}"#, net.ssid.as_str(), net.rssi);
+        let _ = s.push_str(r#"{"ssid":""#);
+        push_json_escaped(&mut s, net.ssid.as_str());
+        let _ = core::write!(s, r#"","rssi":{}}}"#, net.rssi);
     }
     let _ = s.push_str("]}");
     s
@@ -364,8 +480,13 @@ fn format_discovered_tvs(tvs: &[crate::tv::DiscoveredTv]) -> heapless::String<10
     let _ = s.push_str(r#"{"evt":"discovered","tvs":["#);
     for (i, tv) in tvs.iter().enumerate() {
         if i > 0 { let _ = s.push(','); }
-        let _ = core::write!(s, r#"{{"ip":"{}","name":"{}","brand":"{}"}}"#,
-            tv.ip.as_str(), tv.name.as_str(), tv.brand.as_str());
+        let _ = s.push_str(r#"{"ip":""#);
+        push_json_escaped(&mut s, tv.ip.as_str());
+        let _ = s.push_str(r#"","name":""#);
+        push_json_escaped(&mut s, tv.name.as_str());
+        let _ = s.push_str(r#"","brand":""#);
+        push_json_escaped(&mut s, tv.brand.as_str());
+        let _ = s.push_str(r#""}"#);
     }
     let _ = s.push_str("]}");
     s
@@ -374,7 +495,14 @@ fn format_discovered_tvs(tvs: &[crate::tv::DiscoveredTv]) -> heapless::String<10
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn parse_f32_field(s: &str, key: &str) -> Option<f32> {
-    let pos  = s.find(key)?;
+    let mut search_from = 0;
+    let pos = loop {
+        let p = s[search_from..].find(key).map(|i| i + search_from)?;
+        if p == 0 || matches!(s.as_bytes()[p - 1], b'{' | b',' | b' ' | b'\n' | b'\t') {
+            break p;
+        }
+        search_from = p + 1;
+    };
     let rest = s[pos + key.len()..].trim_start_matches(|c: char| c == ' ');
     let end  = rest.find(|c: char| !c.is_ascii_digit() && c != '-' && c != '.')
                    .unwrap_or(rest.len());
@@ -382,11 +510,52 @@ fn parse_f32_field(s: &str, key: &str) -> Option<f32> {
 }
 
 fn parse_str_field<'a>(s: &'a str, key: &str) -> Option<&'a str> {
-    let pos   = s.find(key)?;
+    // Find key at a JSON structural position (after { , or whitespace, not inside a value)
+    let mut search_from = 0;
+    let pos = loop {
+        let p = s[search_from..].find(key).map(|i| i + search_from)?;
+        if p == 0 || matches!(s.as_bytes()[p - 1], b'{' | b',' | b' ' | b'\n' | b'\t') {
+            break p;
+        }
+        search_from = p + 1;
+    };
     let after = &s[pos + key.len()..];
     let inner = after.trim_start_matches(|c: char| c == ' ').strip_prefix('"')?;
-    let end   = inner.find('"')?;
+    // Find the closing quote, skipping escaped quotes (\")
+    // Count consecutive backslashes: even count means the quote is real
+    let mut end = 0;
+    let bytes = inner.as_bytes();
+    while end < bytes.len() {
+        if bytes[end] == b'"' {
+            let mut bs = 0;
+            while end > bs && bytes[end - 1 - bs] == b'\\' { bs += 1; }
+            if bs % 2 == 0 { break; } // even backslashes → real closing quote
+        }
+        end += 1;
+    }
+    if end >= bytes.len() { return None; }
     Some(&inner[..end])
+}
+
+/// Unescape JSON string escape sequences: `\"` → `"` and `\\` → `\`.
+/// Copies into a heapless::String, returning the unescaped result.
+fn json_unescape<const N: usize>(s: &str) -> heapless::String<N> {
+    let mut out: heapless::String<N> = heapless::String::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'"'  => { let _ = out.push('"'); i += 2; }
+                b'\\' => { let _ = out.push('\\'); i += 2; }
+                _     => { let _ = out.push('\\'); i += 1; }
+            }
+        } else {
+            let _ = out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 // ── WebSocket frame encoder ─────────────────────────────────────────────────
@@ -394,6 +563,26 @@ fn parse_str_field<'a>(s: &'a str, key: &str) -> Option<&'a str> {
 fn ws_text_frame(payload: &[u8], out: &mut [u8]) -> usize {
     let len  = payload.len();
     let hlen = if len < 126 { 2 } else { 4 };
+    if hlen + len > out.len() {
+        // Truncate payload to fit in output buffer
+        // Recalculate: try 2-byte header first, then 4-byte if needed
+        let max2 = out.len().saturating_sub(2);
+        let (trunc_hlen, trunc_len) = if max2 < 126 {
+            (2, max2)
+        } else {
+            (4, out.len().saturating_sub(4))
+        };
+        out[0] = 0x81;
+        if trunc_len < 126 {
+            out[1] = trunc_len as u8;
+        } else {
+            out[1] = 126;
+            out[2] = (trunc_len >> 8) as u8;
+            out[3] = (trunc_len & 0xFF) as u8;
+        }
+        out[trunc_hlen..trunc_hlen + trunc_len].copy_from_slice(&payload[..trunc_len]);
+        return trunc_hlen + trunc_len;
+    }
     out[0] = 0x81;
     if len < 126 {
         out[1] = len as u8;

@@ -13,7 +13,7 @@
   <link rel="manifest" href="manifest.json">
   <link rel="apple-touch-icon" href="icon-192.png">
 
-  <!-- data-no-hash: Trunk outputs guardian_pwa.js + guardian_pwa_bg.wasm with fixed names
+  <!-- data-no-hash: Trunk outputs guardian-pwa.js + guardian-pwa_bg.wasm with fixed names
        so firmware-rs/pwa_assets.rs can include_bytes! them at known paths. -->
   <link data-trunk rel="rust" data-wasm-opt="z" data-no-hash/>
   <link data-trunk rel="copy-file" href="manifest.json"/>
@@ -36,6 +36,7 @@
       --safe-bot: env(safe-area-inset-bottom, 0px);
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { touch-action: manipulation; }
     html, body {
       height: 100%;
       background: var(--bg);
@@ -43,10 +44,13 @@
       font-family: -apple-system, BlinkMacSystemFont, sans-serif;
     }
     body { padding-top: var(--safe-top); }
-    #app { height: 100%; display: flex; flex-direction: column; }
+    input, select, textarea { font-size: 16px !important; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    button, label, nav { -webkit-user-select: none; user-select: none; }
+    button:active { opacity: 0.7; transition: opacity 0s; }
+    #app { height: 100%; display: flex; flex-direction: column; max-width: 480px; margin: 0 auto; }
   </style>
 </head>
 <body>
-  <div id="app"></div>
 </body>
 </html>

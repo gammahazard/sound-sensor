@@ -1,11 +1,9 @@
 # Trunk build config — https://trunkrs.dev/
-# Build: trunk build --release
-# Dev:   trunk serve  (runs on localhost:8080, proxies WS to guardian.local:81)
 
 [build]
-# Output to dist/ — firmware-rs/pwa_assets.rs include_bytes! from here
 dist       = "dist"
 public_url = "/"
+filehash   = false
 
 [watch]
 paths = ["src", "index.html"]

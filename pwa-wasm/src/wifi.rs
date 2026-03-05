@@ -2,7 +2,7 @@
 //!
 //! Shows current connection, scan button, network list, and credentials form.
 
-use leptos::*;
+use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use crate::ws::{WsState, NetworkInfo, rssi_bars};
 
@@ -15,22 +15,22 @@ pub fn WifiScreen(
     on_scan:        impl Fn() + 'static,
     on_reconfigure: impl Fn(String, String) + 'static,
 ) -> impl IntoView {
-    let on_scan        = store_value(on_scan);
-    let on_reconfigure = store_value(on_reconfigure);
+    let on_scan        = StoredValue::new_local(on_scan);
+    let on_reconfigure = StoredValue::new_local(on_reconfigure);
 
     let current_host = web_sys::window()
         .and_then(|w| w.location().hostname().ok())
         .unwrap_or_else(|| "guardian.local".to_string());
 
-    let (result_msg, set_result)    = create_signal(String::new());
-    let (result_ok,  set_result_ok) = create_signal(false);
-    let (scanning, set_scanning)    = create_signal(false);
+    let (result_msg, set_result)    = signal(String::new());
+    let (result_ok,  set_result_ok) = signal(false);
+    let (scanning, set_scanning)    = signal(false);
 
     // Clear scanning when results arrive (avoids setting signal in reactive closure)
-    create_effect(move |_| {
+    Effect::new(move || {
         let nets = wifi_networks.get();
         if !nets.is_empty() {
-            set_scanning(false);
+            set_scanning.set(false);
         }
     });
 
@@ -79,12 +79,12 @@ pub fn WifiScreen(
                 <div style="font-weight:700">"Available Networks"</div>
                 <button
                     on:click=move |_| {
-                        set_scanning(true);
-                        on_scan.get_value()();
+                        set_scanning.set(true);
+                        on_scan.with_value(|f| f());
                         let set_s = set_scanning.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             gloo_timers::future::TimeoutFuture::new(8_000).await;
-                            set_s(false);
+                            set_s.set(false);
                         });
                     }
                     disabled=move || scanning.get()
@@ -101,10 +101,7 @@ pub fn WifiScreen(
                 {move || {
                     let nets = wifi_networks.get();
                     if nets.is_empty() {
-                        if !scanning.get() && scanning.get_untracked() == scanning.get() {
-                            // Don't show message while scan hasn't been triggered yet
-                        }
-                        return ().into_view();
+                        return ().into_any();
                     }
                     view! {
                         <div style="display:flex;flex-direction:column;gap:6px">
@@ -131,7 +128,7 @@ pub fn WifiScreen(
                                 }
                             }).collect_view()}
                         </div>
-                    }.into_view()
+                    }.into_any()
                 }}
             </div>
 
@@ -153,7 +150,7 @@ pub fn WifiScreen(
                         placeholder="MyHomeNetwork"
                         autocomplete="off"
                         style="background:#0f172a;border:1px solid #334155;border-radius:10px;\
-                               padding:10px 12px;color:#f1f5f9;font-size:15px;width:100%"
+                               padding:10px 12px;color:#f1f5f9;font-size:16px;width:100%"
                     />
                 </div>
 
@@ -165,7 +162,7 @@ pub fn WifiScreen(
                         placeholder="WiFi password"
                         autocomplete="current-password"
                         style="background:#0f172a;border:1px solid #334155;border-radius:10px;\
-                               padding:10px 12px;color:#f1f5f9;font-size:15px;width:100%"
+                               padding:10px 12px;color:#f1f5f9;font-size:16px;width:100%"
                     />
                 </div>
 
@@ -185,15 +182,20 @@ pub fn WifiScreen(
                         let ssid = get_input_value("wifi-ssid");
                         let pass = get_input_value("wifi-pass");
                         if ssid.is_empty() {
-                            set_result("Enter the network name (SSID)".to_string());
-                            set_result_ok(false);
+                            set_result.set("Enter the network name (SSID)".to_string());
+                            set_result_ok.set(false);
                             return;
                         }
-                        set_result(
+                        let window = web_sys::window().unwrap();
+                        let confirmed = window.confirm_with_message(
+                            "This will disconnect Guardian from the current network. Continue?"
+                        ).unwrap_or(false);
+                        if !confirmed { return; }
+                        set_result.set(
                             format!("Reconnecting to \"{}\"… Guardian may be unreachable briefly.", ssid)
                         );
-                        set_result_ok(true);
-                        on_reconfigure.get_value()(ssid, pass);
+                        set_result_ok.set(true);
+                        on_reconfigure.with_value(|f| f(ssid, pass));
                     }
                     style="width:100%;padding:14px;border-radius:12px;border:none;\
                            background:#6366f1;color:white;font-size:16px;\
