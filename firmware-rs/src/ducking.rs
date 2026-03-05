@@ -35,6 +35,7 @@ use embassy_time::Instant;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DuckCommand {
     VolumeDown,
+    VolumeUp,
     /// Restore TV volume. Carries the saved restore parameters so tv_task
     /// doesn't need to re-read the engine (avoids race on disarm).
     Restore { original_volume: Option<u8>, steps: u8 },

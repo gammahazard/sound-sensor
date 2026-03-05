@@ -40,7 +40,7 @@ use embassy_rp::{
     peripherals::{PIO0, PIO1, USB, TRNG},
 };
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel, mutex::Mutex};
-use portable_atomic::AtomicBool;
+use portable_atomic::{AtomicBool, AtomicU8};
 use static_cell::StaticCell;
 
 /// Structured dev log macro — forwards to WebSocket when `dev-mode` feature is on.
@@ -78,6 +78,9 @@ mod ws;
 
 // ── AP mode flag (true = device is in setup mode) ────────────────────────────
 pub static AP_MODE: AtomicBool = AtomicBool::new(false);
+
+// ── TV connection status (0=off, 1=connecting, 2=connected, 3=error) ─────────
+pub static TV_STATUS: AtomicU8 = AtomicU8::new(0);
 
 use ducking::DuckingEngine;
 use tv::TvConfig;

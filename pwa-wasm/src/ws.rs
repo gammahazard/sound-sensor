@@ -26,6 +26,8 @@ struct ServerMsg {
     #[serde(default)]
     ducking:  Option<bool>,
     #[serde(default)]
+    tv_status: Option<u8>,
+    #[serde(default)]
     fw:       Option<String>,
     #[serde(default)]
     pwa:      Option<String>,
@@ -192,6 +194,7 @@ pub fn use_websocket(
     set_pwa_ver:          WriteSignal<String>,
     set_msg_count:        WriteSignal<u32>,
     set_ducking:          WriteSignal<bool>,
+    set_tv_status:        WriteSignal<u8>,
     set_wifi_networks:    WriteSignal<Vec<NetworkInfo>>,
     set_discovered_tvs:   WriteSignal<Vec<DiscoveredTv>>,
     set_ota_status:       WriteSignal<OtaStatus>,
@@ -271,9 +274,10 @@ pub fn use_websocket(
                                             if let Some(v) = m.db       { set_db.set(v); }
                                             if let Some(v) = m.armed    { set_armed.set(v); }
                                             if let Some(v) = m.tripwire { set_tripwire.set(v); }
-                                            if let Some(v) = m.ducking  { set_ducking.set(v); }
-                                            if let Some(v) = m.fw       { set_fw_ver.set(v); }
-                                            if let Some(v) = m.pwa      { set_pwa_ver.set(v); }
+                                            if let Some(v) = m.ducking    { set_ducking.set(v); }
+                                            if let Some(v) = m.tv_status { set_tv_status.set(v); }
+                                            if let Some(v) = m.fw        { set_fw_ver.set(v); }
+                                            if let Some(v) = m.pwa       { set_pwa_ver.set(v); }
                                         }
                                     }
                                     Some(Ok(Message::Bytes(_))) => {}

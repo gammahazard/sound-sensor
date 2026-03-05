@@ -20,23 +20,30 @@ const BRANDS: &[(&str, &str)] = &[
 pub fn TvScreen(
     tv_ip:          ReadSignal<String>,
     tv_brand:       ReadSignal<String>,
-    tv_connected:   ReadSignal<bool>,
+    tv_status:      ReadSignal<u8>,
     on_connect:     impl Fn(String, String, String) + 'static,
     on_disconnect:  impl Fn() + 'static,
     set_tv_ip:      WriteSignal<String>,
     set_tv_brand:   WriteSignal<String>,
-    set_tv_connected: WriteSignal<bool>,
+    set_tv_status:  WriteSignal<u8>,
     discovered_tvs: ReadSignal<Vec<DiscoveredTv>>,
     on_discover:    impl Fn() + 'static,
+    on_vol_test:    impl Fn(&str) + 'static,
 ) -> impl IntoView {
     let on_connect    = StoredValue::new_local(on_connect);
     let on_disconnect = StoredValue::new_local(on_disconnect);
     let on_discover   = StoredValue::new_local(on_discover);
+    let on_vol_test   = StoredValue::new_local(on_vol_test);
 
     let (brand_sel, set_brand_sel)     = signal(tv_brand.get_untracked());
     let (result_msg, set_result)       = signal(String::new());
     let (result_ok,  set_result_ok)    = signal(false);
     let (discovering, set_discovering) = signal(false);
+
+    // Memo: only re-renders the connected/setup conditional when the boolean
+    // actually changes. Without this, telemetry updating tv_status every 100ms
+    // (even to the same value) would recreate the setup card and steal input focus.
+    let show_connected = Memo::new(move |_| tv_status.get() > 0);
 
     // Clear discovering spinner when results arrive
     Effect::new(move || {
@@ -56,22 +63,79 @@ pub fn TvScreen(
             <div style="background:#1e293b;border-radius:16px;padding:16px">
                 <div style="display:flex;justify-content:space-between;align-items:flex-start">
                     <div>
-                        <div style="font-size:11px;color:#94a3b8;margin-bottom:4px">"CONNECTED TV"</div>
+                        <div style="font-size:11px;color:#94a3b8;margin-bottom:4px">"TV"</div>
                         <div style="font-weight:700;font-size:16px">{brand_label}</div>
                         <div style="font-size:13px;color:#94a3b8;margin-top:4px">{move || tv_ip.get()}</div>
                     </div>
-                    <div style="background:#16a34a;border-radius:999px;padding:4px 10px;\
-                                font-size:11px;font-weight:600">"Connected"</div>
+                    // Dynamic status badge
+                    <div style=move || {
+                        let (bg, text) = match tv_status.get() {
+                            1 => ("#92400e", "Connecting\u{2026}"),
+                            2 => ("#16a34a", "Connected"),
+                            3 => ("#dc2626", "Error"),
+                            _ => ("#475569", "Off"),
+                        };
+                        let _ = text; // used below
+                        format!("background:{};border-radius:999px;padding:4px 10px;\
+                                 font-size:11px;font-weight:600", bg)
+                    }>
+                        {move || match tv_status.get() {
+                            1 => "Connecting\u{2026}",
+                            2 => "Connected",
+                            3 => "Error",
+                            _ => "Off",
+                        }}
+                    </div>
+                </div>
+                // Error hint
+                {move || (tv_status.get() == 3).then(|| view! {
+                    <div style="margin-top:8px;font-size:12px;color:#fca5a5;background:#450a0a;\
+                                border-radius:8px;padding:8px">
+                        "Connection failed. Check TV power and IP."
+                    </div>
+                })}
+                // Volume test buttons
+                <div style="display:flex;gap:8px;margin-top:14px">
+                    <button
+                        on:click=move |_| {
+                            crate::haptic();
+                            on_vol_test.with_value(|f| f("down"));
+                        }
+                        disabled=move || tv_status.get() != 2
+                        style=move || format!(
+                            "flex:1;padding:12px;border-radius:12px;border:none;\
+                             background:#334155;color:{};font-size:18px;\
+                             font-weight:700;cursor:pointer",
+                            if tv_status.get() == 2 { "#f1f5f9" } else { "#475569" }
+                        )
+                    >
+                        "Vol -"
+                    </button>
+                    <button
+                        on:click=move |_| {
+                            crate::haptic();
+                            on_vol_test.with_value(|f| f("up"));
+                        }
+                        disabled=move || tv_status.get() != 2
+                        style=move || format!(
+                            "flex:1;padding:12px;border-radius:12px;border:none;\
+                             background:#334155;color:{};font-size:18px;\
+                             font-weight:700;cursor:pointer",
+                            if tv_status.get() == 2 { "#f1f5f9" } else { "#475569" }
+                        )
+                    >
+                        "Vol +"
+                    </button>
                 </div>
                 <button
                     on:click=move |_| {
                         crate::haptic();
                         set_tv_ip.set(String::new());
-                        set_tv_connected.set(false);
+                        set_tv_status.set(0);
                         set_result.set(String::new());
                         on_disconnect.with_value(|f| f());
                     }
-                    style="margin-top:14px;width:100%;padding:10px;border-radius:12px;\
+                    style="margin-top:8px;width:100%;padding:10px;border-radius:12px;\
                            border:1px solid #475569;background:transparent;color:#f1f5f9;\
                            font-size:14px;font-weight:600;cursor:pointer"
                 >
@@ -280,7 +344,7 @@ pub fn TvScreen(
 
                         set_tv_ip.set(ip.clone());
                         set_tv_brand.set(brand.clone());
-                        set_tv_connected.set(true);
+                        set_tv_status.set(1);
                         on_connect.with_value(|f| f(ip, brand, psk));
                     }
                     style="width:100%;padding:14px;border-radius:12px;border:none;\
@@ -302,7 +366,7 @@ pub fn TvScreen(
                 </div>
             </div>
 
-            {move || if tv_connected.get() {
+            {move || if show_connected.get() {
                 connected_card().into_any()
             } else {
                 setup_card().into_any()

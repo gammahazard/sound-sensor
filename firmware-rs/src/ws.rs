@@ -164,11 +164,12 @@ async fn handle_client(
                 }
 
                 // Broadcast telemetry
+                let tv_status = crate::TV_STATUS.load(portable_atomic::Ordering::Relaxed);
                 let mut json: heapless::String<224> = heapless::String::new();
                 let _ = core::write!(
                     json,
-                    r#"{{"db":{:.2},"armed":{},"tripwire":{:.2},"ducking":{},"fw":"{}","pwa":"{}""#,
-                    db, armed, tripwire, ducking,
+                    r#"{{"db":{:.2},"armed":{},"tripwire":{:.2},"ducking":{},"tv_status":{},"fw":"{}","pwa":"{}""#,
+                    db, armed, tripwire, ducking, tv_status,
                     crate::FW_VERSION,
                     crate::PWA_VERSION,
                 );
@@ -364,6 +365,7 @@ async fn apply_command(
         if let Some(ip_str) = ip {
             if ip_str.is_empty() {
                 // Clear TV config
+                crate::TV_STATUS.store(0, portable_atomic::Ordering::Relaxed);
                 let cfg_to_save = {
                     let mut cfg = tv_config.lock().await;
                     cfg.ip.clear();
@@ -379,6 +381,7 @@ async fn apply_command(
             }
 
             if let Some(brand) = brand {
+                crate::TV_STATUS.store(1, portable_atomic::Ordering::Relaxed);
                 let cfg_to_save = {
                     let mut cfg = tv_config.lock().await;
                     cfg.samsung_token.clear();
@@ -400,6 +403,14 @@ async fn apply_command(
                 warn!("[ws] set_tv: unknown brand");
             }
         }
+
+    } else if cmd == Some("vol_up") {
+        info!("[ws] Volume up (test)");
+        crate::tv::send_duck_command(DuckCommand::VolumeUp).await;
+
+    } else if cmd == Some("vol_down") {
+        info!("[ws] Volume down (test)");
+        crate::tv::send_duck_command(DuckCommand::VolumeDown).await;
 
     } else if cmd == Some("discover_tvs") {
         info!("[ws] TV discovery requested");

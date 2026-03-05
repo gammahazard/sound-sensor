@@ -122,7 +122,9 @@ fn App() -> impl IntoView {
     // TV settings
     let (tv_ip,        set_tv_ip)        = signal(local_get("tv_ip",    ""));
     let (tv_brand,     set_tv_brand)     = signal(local_get("tv_brand", "lg"));
-    let (tv_connected, set_tv_connected) = signal(!local_get("tv_ip", "").is_empty());
+    let (tv_status, set_tv_status) = signal(
+        if local_get("tv_ip", "").is_empty() { 0u8 } else { 1u8 }
+    );
 
     // WiFi networks from scan
     let (wifi_networks, set_wifi_networks) = signal(Vec::<ws::NetworkInfo>::new());
@@ -173,7 +175,7 @@ fn App() -> impl IntoView {
     let send = ws::use_websocket(
         set_db, set_armed, set_tripwire, set_ws_state,
         set_fw_ver, set_pwa_ver, set_msg_count,
-        set_ducking, set_wifi_networks, set_discovered_tvs, set_ota_status,
+        set_ducking, set_tv_status, set_wifi_networks, set_discovered_tvs, set_ota_status,
         set_dev_mode, set_dev_logs, set_raw_ws_log, set_reconnect_count, set_last_msg_time,
     );
     let send_sv = StoredValue::new_local(send);
@@ -282,15 +284,16 @@ fn App() -> impl IntoView {
                         <tv::TvScreen
                             tv_ip=tv_ip
                             tv_brand=tv_brand
-                            tv_connected=tv_connected
+                            tv_status=tv_status
                             set_tv_ip=set_tv_ip
                             set_tv_brand=set_tv_brand
-                            set_tv_connected=set_tv_connected
+                            set_tv_status=set_tv_status
                             discovered_tvs=discovered_tvs
                             on_connect=move |ip: String, brand: String, psk: String| {
                                 local_set("tv_ip",    &ip);
                                 local_set("tv_brand", &brand);
                                 local_set("tv_psk",   &psk);
+                                set_tv_status.set(1); // Optimistic "Connecting..."
                                 add_event_sv.with_value(|f| {
                                     f(format!("TV: {} @ {}", brand.to_uppercase(), ip))
                                 });
@@ -308,6 +311,7 @@ fn App() -> impl IntoView {
                                 local_set("tv_psk",   "");
                                 local_set("tv_brand", "lg");
                                 set_tv_brand.set("lg".to_string());
+                                set_tv_status.set(0);
                                 set_discovered_tvs.set(Vec::new());
                                 add_event_sv.with_value(|f| f("TV disconnected".to_string()));
                                 // Send clear command to firmware
@@ -315,6 +319,10 @@ fn App() -> impl IntoView {
                             }
                             on_discover=move || {
                                 send_sv.with_value(|f| f(r#"{"cmd":"discover_tvs"}"#.to_string()));
+                            }
+                            on_vol_test=move |dir: &str| {
+                                let cmd = if dir == "up" { r#"{"cmd":"vol_up"}"# } else { r#"{"cmd":"vol_down"}"# };
+                                send_sv.with_value(|f| f(cmd.to_string()));
                             }
                         />
                     }.into_any(),
@@ -348,7 +356,7 @@ fn App() -> impl IntoView {
                             pwa_ver=pwa_ver
                             tv_ip=tv_ip
                             tv_brand=tv_brand
-                            tv_connected=tv_connected
+                            tv_status=tv_status
                             msg_count=msg_count
                             reconnect_count=reconnect_count
                             last_msg_time=last_msg_time

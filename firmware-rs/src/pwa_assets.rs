@@ -18,7 +18,7 @@ pub static WASM_BG_GZ: &[u8] =
 // ── App shell ─────────────────────────────────────────────────────────────────
 
 pub static INDEX_HTML: &[u8] =
-    include_bytes!("../../pwa-wasm/dist/index.html");
+    include_bytes!(concat!(env!("OUT_DIR"), "/index.html"));
 
 pub static SW_JS: &[u8] =
     include_bytes!("../../pwa-wasm/dist/sw.js");

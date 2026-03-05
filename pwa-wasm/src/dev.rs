@@ -67,7 +67,7 @@ pub fn DevScreen(
     pwa_ver:          ReadSignal<String>,
     tv_ip:            ReadSignal<String>,
     tv_brand:         ReadSignal<String>,
-    tv_connected:     ReadSignal<bool>,
+    tv_status:        ReadSignal<u8>,
     msg_count:        ReadSignal<u32>,
     reconnect_count:  ReadSignal<u32>,
     last_msg_time:    ReadSignal<String>,
@@ -108,7 +108,7 @@ pub fn DevScreen(
                     if ip.is_empty() { "none".to_string() }
                     else { format!("{}@{}", tv_brand.get(), ip) }
                 } />
-                <StateRow label="tv_conn"  value=move || bool_str(tv_connected.get()) />
+                <StateRow label="tv_status" value=move || tv_status_str(tv_status.get()) />
                 <StateRow label="pwa"      value=move || pwa_ver.get() />
             </div>
 
@@ -313,6 +313,16 @@ fn InfoRow(
 
 fn bool_str(v: bool) -> String {
     if v { "true".to_string() } else { "false".to_string() }
+}
+
+fn tv_status_str(v: u8) -> String {
+    match v {
+        0 => "off".to_string(),
+        1 => "connecting".to_string(),
+        2 => "connected".to_string(),
+        3 => "error".to_string(),
+        _ => format!("unknown({})", v),
+    }
 }
 
 fn ws_str(s: WsState) -> String {

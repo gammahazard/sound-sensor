@@ -22,6 +22,17 @@ const SAMPLE_RATE:    u32 = 16_000;
 const WINDOW_SAMPLES: usize = 1_600;   // 100 ms at 16 kHz
 const FULL_SCALE_24:  f32 = 8_388_608.0; // 2^23
 
+// 2nd-order Butterworth high-pass filter at 200 Hz (fs = 16 kHz)
+// Removes DC, 50/60 Hz mains hum, and low-frequency power supply noise.
+// -12 dB/octave rolloff → ~24 dB attenuation at 50 Hz.
+// Baby crying (250+ Hz) and speech pass through with minimal loss.
+// Coefficients pre-computed and normalized by a0.
+const HPF_B0: f32 =  0.9460;
+const HPF_B1: f32 = -1.8920;
+const HPF_B2: f32 =  0.9460;
+const HPF_A1: f32 = -1.8890;
+const HPF_A2: f32 =  0.8949;
+
 #[embassy_executor::task]
 pub async fn audio_task(
     pio:      PIO0,
@@ -90,10 +101,23 @@ pub async fn audio_task(
 
     info!("[audio] PIO I2S master @ {}Hz, div=73", SAMPLE_RATE);
 
-    // Discard first ~100ms of samples (mic PDM modulator stabilization)
-    for _ in 0..(SAMPLE_RATE as usize / 10) {
-        let _left: u32 = sm0.rx().wait_pull().await;
+    // ── HPF state (2nd-order biquad) ─────────────────────────────────────
+    let mut hpf_x1: f32 = 0.0;
+    let mut hpf_x2: f32 = 0.0;
+    let mut hpf_y1: f32 = 0.0;
+    let mut hpf_y2: f32 = 0.0;
+
+    // Warmup: 200ms — mic PDM stabilization + HPF settling
+    for _ in 0..(SAMPLE_RATE as usize / 5) {
+        let raw: u32 = sm0.rx().wait_pull().await;
         let _right: u32 = sm0.rx().wait_pull().await;
+        let sample = ((raw as i32) >> 8) as f32;
+        let y = HPF_B0 * sample + HPF_B1 * hpf_x1 + HPF_B2 * hpf_x2
+              - HPF_A1 * hpf_y1 - HPF_A2 * hpf_y2;
+        hpf_x2 = hpf_x1;
+        hpf_x1 = sample;
+        hpf_y2 = hpf_y1;
+        hpf_y1 = y;
     }
     info!("[audio] Mic warmup complete");
 
@@ -103,13 +127,8 @@ pub async fn audio_task(
     let mut buf  = [0f32; WINDOW_SAMPLES];
     let mut idx  = 0usize;
     let mut smoothed: f32 = -96.0;
-    const EMA_ALPHA: f32 = 0.15; // EMA smoothing on dB output
-
-    // IIR DC blocker: y[n] = x[n] - x[n-1] + R * y[n-1]
-    // R=0.9992 → cuts below ~2 Hz at 16 kHz (per ESP32-I2S-SLM reference)
-    let mut dc_prev_x: f32 = 0.0;
-    let mut dc_prev_y: f32 = 0.0;
-    const DC_R: f32 = 0.9992;
+    const EMA_ATTACK: f32 = 0.3;  // Fast rise — catches loud events quickly
+    const EMA_DECAY:  f32 = 0.08; // Slow fall — stable reading during quiet
 
     loop {
         let raw: u32 = sm0.rx().wait_pull().await;     // Left channel (has data)
@@ -118,10 +137,14 @@ pub async fn audio_task(
         // SPH0645: 24-bit data left-justified in 32-bit word; right-shift 8 for signed 24-bit
         let sample = ((raw as i32) >> 8) as f32;
 
-        // DC blocker: removes DC offset and very low frequency drift
-        let filtered = sample - dc_prev_x + DC_R * dc_prev_y;
-        dc_prev_x = sample;
-        dc_prev_y = filtered;
+        // 2nd-order Butterworth HPF at 200 Hz (replaces DC blocker)
+        // Removes DC offset, 50/60 Hz mains hum, and power supply noise
+        let filtered = HPF_B0 * sample + HPF_B1 * hpf_x1 + HPF_B2 * hpf_x2
+                     - HPF_A1 * hpf_y1 - HPF_A2 * hpf_y2;
+        hpf_x2 = hpf_x1;
+        hpf_x1 = sample;
+        hpf_y2 = hpf_y1;
+        hpf_y1 = filtered;
 
         buf[idx] = filtered;
         idx += 1;
@@ -129,7 +152,8 @@ pub async fn audio_task(
         if idx >= WINDOW_SAMPLES {
             idx = 0;
             let db = compute_db(&buf);
-            smoothed = EMA_ALPHA * db + (1.0 - EMA_ALPHA) * smoothed;
+            let alpha = if db > smoothed { EMA_ATTACK } else { EMA_DECAY };
+            smoothed = alpha * db + (1.0 - alpha) * smoothed;
             if DB_CHANNEL.try_send(smoothed).is_err() {
                 dev_log!(crate::dev_log::LogCat::Audio, crate::dev_log::LogLevel::Warn,
                     "DB_CHANNEL full, dropped db={:.1}", smoothed);

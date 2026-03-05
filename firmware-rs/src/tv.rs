@@ -16,7 +16,7 @@ use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel, mu
 use embassy_time::{Duration, Timer, with_timeout};
 
 use crate::ducking::{DuckCommand, DuckingEngine};
-use crate::{WifiCmd, WIFI_CMD_CH};
+use crate::{WifiCmd, WIFI_CMD_CH, TV_STATUS};
 
 const SAMSUNG_TLS_PORT: u16 = 8002;
 
@@ -73,6 +73,12 @@ impl TvBrand {
             3 => TvBrand::Roku,
             _ => TvBrand::Lg,
         }
+    }
+
+    /// LG and Samsung use persistent WebSocket connections.
+    /// Sony and Roku use plain HTTP (reconnect per command).
+    pub fn uses_websocket(self) -> bool {
+        matches!(self, TvBrand::Lg | TvBrand::Samsung)
     }
 }
 
@@ -247,6 +253,7 @@ pub async fn tv_task(
         };
 
         if !config.is_configured() {
+            TV_STATUS.store(0, portable_atomic::Ordering::Relaxed);
             info!("[tv] No TV configured. Waiting…");
             Timer::after(Duration::from_secs(10)).await;
             continue;
@@ -260,12 +267,14 @@ pub async fn tv_task(
         let tv_addr = match parse_ip(config.ip.as_str()) {
             Some(a) => IpEndpoint::new(a, tv_port),
             None => {
+                TV_STATUS.store(3, portable_atomic::Ordering::Relaxed);
                 warn!("[tv] Invalid IP: {}", config.ip.as_str());
                 Timer::after(Duration::from_secs(30)).await;
                 continue;
             }
         };
 
+        TV_STATUS.store(1, portable_atomic::Ordering::Relaxed);
         info!("[tv] Connecting to {} ({:?}) port {}", config.ip.as_str(), config.brand, tv_port);
         dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
             "connecting {}:{} brand={:?}", config.ip.as_str(), tv_port, config.brand);
@@ -274,6 +283,7 @@ pub async fn tv_task(
         socket.set_timeout(Some(Duration::from_secs(15)));
 
         if let Err(_e) = socket.connect(tv_addr).await {
+            TV_STATUS.store(3, portable_atomic::Ordering::Relaxed);
             dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Error,
                 "tcp_fail {}:{}", config.ip.as_str(), tv_port);
             warn!("[tv] TCP connect failed — retry in 15s");
@@ -347,6 +357,7 @@ pub async fn tv_task(
         };
 
         if !connected {
+            TV_STATUS.store(3, portable_atomic::Ordering::Relaxed);
             dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Warn,
                 "handshake fail {:?}", config.brand);
             warn!("[tv] Handshake failed — retry in 10s");
@@ -354,6 +365,7 @@ pub async fn tv_task(
             continue;
         }
 
+        TV_STATUS.store(2, portable_atomic::Ordering::Relaxed);
         active_ip.clear();
         let _ = active_ip.push_str(config.ip.as_str());
         dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
@@ -361,91 +373,96 @@ pub async fn tv_task(
         info!("[tv] Ready ({:?})", config.brand);
 
         // ── Command loop ────────────────────────────────────────────────────
-        'cmd: loop {
-            let current_ip = {
-                let c = tv_config.lock().await;
-                c.ip.clone()
-            };
-            if current_ip != active_ip {
-                info!("[tv] Config changed — reconnecting");
-                break 'cmd;
-            }
+        // LG/Samsung: persistent WebSocket — keepalive every 25s.
+        // Sony/Roku: plain HTTP — fresh TCP connection per command (servers
+        //   close idle keep-alive connections after ~15-30s, and limit total
+        //   requests per connection).
+        if config.brand.uses_websocket() {
+            // ── WebSocket path (LG, Samsung) — persistent connection ─────
+            'cmd: loop {
+                let current_ip = {
+                    let c = tv_config.lock().await;
+                    c.ip.clone()
+                };
+                if current_ip != active_ip {
+                    info!("[tv] Config changed — reconnecting");
+                    break 'cmd;
+                }
 
-            let cmd = DUCK_CHANNEL.receive().await;
-            let brand = config.brand;
-
-            match cmd {
-                DuckCommand::None => continue,
-
-                DuckCommand::VolumeDown => {
-                    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
-                        "duck_cmd: VolumeDown");
-                    let needs_query = {
-                        let eng = engine.lock().await;
-                        eng.original_volume.is_none() && brand.supports_absolute_volume()
-                    };
-                    if needs_query {
-                        if let Some(vol) = tv_get_volume(brand, &mut socket, &mut out_frame, &config).await {
-                            let mut eng = engine.lock().await;
-                            eng.set_original_volume(vol);
+                let cmd = match with_timeout(Duration::from_secs(25), DUCK_CHANNEL.receive()).await {
+                    Ok(cmd) => cmd,
+                    Err(_) => {
+                        if tv_keepalive(config.brand, &mut socket, &mut out_frame, &config).await {
                             dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
-                                "got_volume={}", vol);
-                            info!("[tv] Captured original volume: {}", vol);
+                                "keepalive ok");
+                            continue;
                         } else {
                             dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Warn,
-                                "volume_query_fail");
+                                "keepalive fail, reconnecting");
+                            info!("[tv] Keepalive failed — reconnecting");
+                            break 'cmd;
                         }
                     }
+                };
 
-                    let ok = tv_volume_down(brand, &mut socket, &mut out_frame, &config).await;
-                    if !ok {
-                        dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Error,
-                            "vol_down_fail, reconnecting");
-                        warn!("[tv] VolumeDown failed — reconnecting");
-                        break 'cmd;
-                    }
-                    info!("[tv] Volume down");
-                }
-
-                DuckCommand::Restore { original_volume: orig, steps } => {
-                    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
-                        "duck_cmd: Restore orig={:?} steps={}", orig, steps);
-                    let ok = if brand.supports_absolute_volume() {
-                        if let Some(orig_vol) = orig {
-                            let current = orig_vol.saturating_sub(steps);
-                            tv_ramp_up_absolute(brand, &mut socket, &mut out_frame, &config, current, orig_vol).await
-                        } else {
-                            // Volume query failed at duck start — fall back to relative ramp
-                            tv_ramp_up_relative(brand, &mut socket, &mut out_frame, &config, steps).await
-                        }
-                    } else {
-                        tv_ramp_up_relative(brand, &mut socket, &mut out_frame, &config, steps).await
-                    };
-
-                    if !ok {
-                        dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Error,
-                            "restore_fail, clearing duck state");
-                        warn!("[tv] Restore failed — clearing duck state, reconnecting");
-                        let mut eng = engine.lock().await;
-                        eng.clear_duck_state();
-                        break 'cmd;
-                    }
-                    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
-                        "restored ok");
-                    info!("[tv] Volume restored");
-
-                    // Only clear duck state if still Restoring. If user disarmed
-                    // and re-armed during the ramp, engine may be in a new Ducking
-                    // session — don't clobber it.
-                    let mut eng = engine.lock().await;
-                    if eng.state() == crate::ducking::DuckingState::Restoring {
-                        eng.clear_duck_state();
-                    }
-                }
+                let ok = exec_duck_cmd(
+                    cmd, config.brand, &mut socket, &mut out_frame, &config, engine,
+                ).await;
+                if !ok { break 'cmd; }
             }
-        }
+            TV_STATUS.store(1, portable_atomic::Ordering::Relaxed);
+            Timer::after(Duration::from_secs(5)).await;
+        } else {
+            // ── HTTP path (Sony, Roku) — fresh socket per command ─────────
+            // Drop the handshake socket so we can create fresh ones per cmd.
+            drop(socket);
 
-        Timer::after(Duration::from_secs(5)).await;
+            'cmd: loop {
+                let current_ip = {
+                    let c = tv_config.lock().await;
+                    c.ip.clone()
+                };
+                if current_ip != active_ip {
+                    info!("[tv] Config changed");
+                    break 'cmd;
+                }
+
+                // No keepalive needed — we reconnect per command.
+                let cmd = DUCK_CHANNEL.receive().await;
+                if let DuckCommand::None = cmd { continue; }
+
+                // Fresh TCP socket for this command
+                let mut cmd_socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
+                cmd_socket.set_timeout(Some(Duration::from_secs(10)));
+
+                if let Err(_) = cmd_socket.connect(tv_addr).await {
+                    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Error,
+                        "http_connect_fail");
+                    warn!("[tv] HTTP connect failed");
+                    TV_STATUS.store(3, portable_atomic::Ordering::Relaxed);
+                    Timer::after(Duration::from_secs(5)).await;
+                    // Retry: don't break 'cmd, just try next command with a new socket
+                    TV_STATUS.store(2, portable_atomic::Ordering::Relaxed);
+                    continue;
+                }
+
+                let ok = exec_duck_cmd(
+                    cmd, config.brand, &mut cmd_socket, &mut out_frame, &config, engine,
+                ).await;
+
+                if !ok {
+                    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Warn,
+                        "http cmd fail, will retry next cmd");
+                    warn!("[tv] HTTP command failed — will retry on next command");
+                    // Don't break — just let the next command try a fresh connection.
+                    // Only break if config changed (checked at top of loop).
+                }
+                // cmd_socket dropped here — connection cleanly closed
+            }
+            // Config changed — loop back to re-read config
+            TV_STATUS.store(1, portable_atomic::Ordering::Relaxed);
+            Timer::after(Duration::from_millis(200)).await;
+        }
     }
 }
 
@@ -511,6 +528,124 @@ async fn tv_set_volume(brand: TvBrand, s: &mut TcpSocket<'_>, out: &mut [u8; 512
         TvBrand::Lg   => lg_set_volume(s, out, vol).await,
         TvBrand::Sony => sony_set_volume(s, out, cfg, vol).await,
         TvBrand::Samsung | TvBrand::Roku => false,
+    }
+}
+
+// ── Keepalive probe ──────────────────────────────────────────────────────────
+/// Send a lightweight probe to keep the TCP connection alive.
+/// Returns true if the connection is still healthy.
+async fn tv_keepalive(brand: TvBrand, s: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &TvConfig) -> bool {
+    match brand {
+        // LG/Sony: query current volume (small response, no side-effects)
+        TvBrand::Lg   => lg_get_volume(s, out).await.is_some(),
+        TvBrand::Sony => sony_get_volume(s, out, cfg).await.is_some(),
+        // Samsung: send a WebSocket ping frame (opcode 0x9)
+        TvBrand::Samsung => {
+            out[0] = 0x89; // FIN + ping opcode
+            out[1] = 0x80; // MASK bit, 0-length payload
+            out[2..6].copy_from_slice(&[0x37, 0x5A, 0x1E, 0x9C]); // mask key
+            s.write_all(&out[..6]).await.is_ok()
+        }
+        // Roku: lightweight device-info query
+        TvBrand::Roku => {
+            let mut req: heapless::String<128> = heapless::String::new();
+            let _ = core::write!(req,
+                "GET /query/device-info HTTP/1.1\r\nHost: {}:8060\r\nConnection: keep-alive\r\n\r\n",
+                cfg.ip.as_str()
+            );
+            if s.write_all(req.as_bytes()).await.is_err() { return false; }
+            read_http_response(s, out).await.is_some()
+        }
+    }
+}
+
+// ── Duck command executor (shared by WS and HTTP paths) ─────────────────────
+async fn exec_duck_cmd(
+    cmd:    DuckCommand,
+    brand:  TvBrand,
+    socket: &mut TcpSocket<'_>,
+    out:    &mut [u8; 512],
+    cfg:    &TvConfig,
+    engine: &Mutex<ThreadModeRawMutex, DuckingEngine>,
+) -> bool {
+    match cmd {
+        DuckCommand::None => true,
+
+        DuckCommand::VolumeUp => {
+            dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                "duck_cmd: VolumeUp");
+            let ok = tv_volume_up(brand, socket, out, cfg).await;
+            if !ok {
+                dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Error,
+                    "vol_up_fail");
+                warn!("[tv] VolumeUp failed");
+            } else {
+                info!("[tv] Volume up");
+            }
+            ok
+        }
+
+        DuckCommand::VolumeDown => {
+            dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                "duck_cmd: VolumeDown");
+            let needs_query = {
+                let eng = engine.lock().await;
+                eng.original_volume.is_none() && brand.supports_absolute_volume()
+            };
+            if needs_query {
+                if let Some(vol) = tv_get_volume(brand, socket, out, cfg).await {
+                    let mut eng = engine.lock().await;
+                    eng.set_original_volume(vol);
+                    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                        "got_volume={}", vol);
+                    info!("[tv] Captured original volume: {}", vol);
+                } else {
+                    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Warn,
+                        "volume_query_fail");
+                }
+            }
+            let ok = tv_volume_down(brand, socket, out, cfg).await;
+            if !ok {
+                dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Error,
+                    "vol_down_fail");
+                warn!("[tv] VolumeDown failed");
+            } else {
+                info!("[tv] Volume down");
+            }
+            ok
+        }
+
+        DuckCommand::Restore { original_volume: orig, steps } => {
+            dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                "duck_cmd: Restore orig={:?} steps={}", orig, steps);
+            let ok = if brand.supports_absolute_volume() {
+                if let Some(orig_vol) = orig {
+                    let current = orig_vol.saturating_sub(steps);
+                    tv_ramp_up_absolute(brand, socket, out, cfg, current, orig_vol).await
+                } else {
+                    tv_ramp_up_relative(brand, socket, out, cfg, steps).await
+                }
+            } else {
+                tv_ramp_up_relative(brand, socket, out, cfg, steps).await
+            };
+
+            if !ok {
+                dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Error,
+                    "restore_fail, clearing duck state");
+                warn!("[tv] Restore failed — clearing duck state");
+                let mut eng = engine.lock().await;
+                eng.clear_duck_state();
+            } else {
+                dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                    "restored ok");
+                info!("[tv] Volume restored");
+                let mut eng = engine.lock().await;
+                if eng.state() == crate::ducking::DuckingState::Restoring {
+                    eng.clear_duck_state();
+                }
+            }
+            ok
+        }
     }
 }
 

@@ -60,7 +60,12 @@
       "WebFetch(domain:devzone.nordicsemi.com)",
       "WebFetch(domain:hackaday.io)",
       "WebFetch(domain:forums.indigodomo.com)",
-      "WebFetch(domain:forums.adafruit.com)"
+      "WebFetch(domain:forums.adafruit.com)",
+      "Bash(sed:*)",
+      "Bash(find:*)",
+      "Bash(picotool version:*)",
+      "Bash(chmod +x:*)",
+      "Bash(./mk-uf2.sh:*)"
     ]
   }
 }
