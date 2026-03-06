@@ -104,6 +104,18 @@ pub fn json_unescape(s: &str) -> heapless::String<64> {
     out
 }
 
+/// Escape `"` and `\` for safe embedding inside a JSON string.
+pub fn push_json_escaped<const N: usize>(out: &mut heapless::String<N>, s: &str) {
+    for &b in s.as_bytes() {
+        match b {
+            b'"'  => { let _ = out.push_str("\\\""); }
+            b'\\' => { let _ = out.push_str("\\\\"); }
+            _ => { let _ = out.push(b as char); }
+        }
+    }
+}
+
+
 /// Parse an IPv4 address string into 4 octets.
 pub fn parse_ip(s: &str) -> Option<[u8; 4]> {
     let mut p = s.splitn(4, '.');

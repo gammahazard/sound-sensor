@@ -367,6 +367,7 @@ async fn apply_command(
                 if WIFI_CMD_CH.try_send(WifiCmd::SaveTvConfig(cfg_to_save)).is_err() {
                     warn!("[ws] Failed to send SaveTvConfig (clear)");
                 }
+                let _ = crate::tv::TV_WAKE_CH.try_send(());
                 info!("[ws] TV disconnected");
                 return;
             }
@@ -389,6 +390,7 @@ async fn apply_command(
                 if WIFI_CMD_CH.try_send(WifiCmd::SaveTvConfig(cfg_to_save)).is_err() {
                     warn!("[ws] Failed to send SaveTvConfig");
                 }
+                let _ = crate::tv::TV_WAKE_CH.try_send(());
                 info!("[ws] TV → {} ({:?})", ip_str, brand);
             } else {
                 warn!("[ws] set_tv: unknown brand");

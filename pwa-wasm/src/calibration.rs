@@ -8,7 +8,8 @@ use leptos::prelude::*;
 
 fn local_get_f32(key: &str, default: f32) -> f32 {
     let k = format!("cal_{}", key);
-    crate::local_get(&k, &default.to_string()).parse().unwrap_or(default)
+    let v = crate::local_get(&k, &default.to_string()).parse().unwrap_or(default);
+    if v.is_finite() { v } else { default }
 }
 
 fn local_set_f32(key: &str, val: f32) {

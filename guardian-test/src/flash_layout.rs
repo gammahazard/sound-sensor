@@ -13,7 +13,8 @@
 //!   Byte  174:     calibration_valid (0=no, 1=yes)
 //!   Bytes 175–178: floor_db (f32 LE)
 //!   Bytes 179–182: tripwire_db (f32 LE)
-//!   Bytes 183–251: reserved
+//!   Bytes 183–188: tv_mac (6 bytes, for Wake-on-LAN)
+//!   Bytes 189–251: reserved
 //!   Bytes 252–255: CRC32 over bytes 0–251
 
 use crate::crypto::crc32;
@@ -106,8 +107,6 @@ pub fn save_tv_config(buf: &mut [u8; 256], tv: &TvConfig) {
     buf[149] = tv.brand.to_u8();
     write_field(&mut buf[150..166], tv.samsung_token.as_str(), 16);
     write_field(&mut buf[166..174], tv.sony_psk.as_str(), 8);
-    // Note: sony_psk field is exactly 8 bytes, last byte may not be null
-    // if PSK is exactly 8 chars. But read_null_terminated handles that.
     finalize_crc(buf);
 }
 

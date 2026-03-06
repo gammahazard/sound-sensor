@@ -6,6 +6,7 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DuckCommand {
     VolumeDown,
+    VolumeUp,
     Restore { original_volume: Option<u8>, steps: u8 },
     None,
 }
@@ -52,7 +53,7 @@ impl DuckingEngine {
 
     /// Testable tick: takes current time as milliseconds instead of Instant::now().
     pub fn tick_at(&mut self, db: f32, now_ms: u64) -> DuckCommand {
-        if db.is_nan() {
+        if !db.is_finite() {
             return DuckCommand::None;
         }
         if !self.armed {

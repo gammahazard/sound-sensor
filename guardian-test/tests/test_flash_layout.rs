@@ -228,3 +228,6 @@ fn calibration_roundtrip() {
     let creds = load_wifi_creds(&buf).unwrap();
     assert_eq!(creds.ssid.as_str(), "Net");
 }
+
+// ── MAC address ────────────────────────────────────────────────────────────
+

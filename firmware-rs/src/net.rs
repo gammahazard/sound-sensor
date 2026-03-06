@@ -12,7 +12,8 @@
 //!   Byte  174:     calibration_valid (0=no, 1=yes)
 //!   Bytes 175–178: floor_db (f32 LE)
 //!   Bytes 179–182: tripwire_db (f32 LE)
-//!   Bytes 183–251: reserved
+//!   Bytes 183–188: tv_mac (6 bytes, for Wake-on-LAN power on)
+//!   Bytes 189–251: reserved
 //!   Bytes 252–255: CRC32 over bytes 0–251
 
 use defmt::*;
@@ -32,7 +33,7 @@ use cyw43::JoinOptions;
 use cyw43_pio::PioSpi;
 
 use crate::ducking::DuckingEngine;
-use crate::tv::{TvBrand, TvConfig};
+use crate::tv::TvConfig;
 use crate::{LedPattern, LED_CHANNEL, WifiCmd, WifiEvent, WIFI_CMD_CH, WIFI_EVT_CH, NetworkInfo};
 
 use crate::flash_config::*;
@@ -281,7 +282,9 @@ pub async fn wifi_task(
         // Turn LED off briefly to signal "join succeeded, waiting for IP"
         control.gpio_set(0, false).await;
 
-        let cfg = NetConfig::dhcpv4(Default::default());
+        let mut dhcp_cfg = embassy_net::DhcpConfig::default();
+        dhcp_cfg.hostname = Some(heapless::String::try_from("guardian").unwrap());
+        let cfg = NetConfig::dhcpv4(dhcp_cfg);
         let seed = tls_seed;
 
         let resources = RESOURCES.init(StackResources::new());
@@ -421,10 +424,21 @@ async fn handle_wifi_cmd(
         }
         WifiCmd::Reconfigure { ssid, pass } => {
             info!("[net] Reconfiguring WiFi → {}", ssid.as_str());
-            flash_save_creds(fs.flash_mut(), ssid.as_str(), pass.as_str());
-            // Soft reboot
-            Timer::after(Duration::from_millis(500)).await;
-            cortex_m::peripheral::SCB::sys_reset();
+            let saved = flash_save_creds(fs.flash_mut(), ssid.as_str(), pass.as_str());
+            if saved {
+                // Verify read-back before rebooting
+                if flash_load_creds(fs.flash_mut()).is_some() {
+                    Timer::after(Duration::from_millis(500)).await;
+                    cortex_m::peripheral::SCB::sys_reset();
+                } else {
+                    warn!("[net] Cred save verification failed!");
+                    let _ = LED_CHANNEL.try_send(LedPattern::Error);
+                    // Stay in current mode so user can retry
+                }
+            } else {
+                warn!("[net] Cred flash write failed!");
+                let _ = LED_CHANNEL.try_send(LedPattern::Error);
+            }
         }
         WifiCmd::SaveTvConfig(tv_cfg) => {
             info!("[net] Saving TV config to flash");

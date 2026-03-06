@@ -13,6 +13,7 @@ use embassy_net::{Stack, IpAddress, IpEndpoint};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::UdpSocket;
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel, mutex::Mutex};
+use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Timer, with_timeout};
 
 use crate::ducking::{DuckCommand, DuckingEngine};
@@ -108,6 +109,20 @@ impl TvConfig {
     pub fn is_configured(&self) -> bool { !self.ip.is_empty() }
 }
 
+// ── Config-change wake signal (ws_task → tv_task) ───────────────────────────
+/// ws.rs signals this when a `set_tv` command updates the TV config,
+/// so tv_task can abort its retry sleep and read the new config immediately.
+pub static TV_WAKE_CH: Channel<ThreadModeRawMutex, (), 1> = Channel::new();
+
+/// Wait for a duration, but wake early if TV config changes.
+/// Returns `true` if woken by signal (config changed).
+async fn wait_or_wake(dur: Duration) -> bool {
+    match select(Timer::after(dur), TV_WAKE_CH.receive()).await {
+        Either::First(_) => false,
+        Either::Second(_) => true,
+    }
+}
+
 // ── Duck command channel (ducking_task → tv_task) ────────────────────────────
 static DUCK_CHANNEL: Channel<ThreadModeRawMutex, DuckCommand, 8> = Channel::new();
 
@@ -128,7 +143,14 @@ pub struct DiscoveredTv {
     pub brand: heapless::String<16>,
 }
 
-/// Send SSDP M-SEARCH and collect TV responses (~3 seconds).
+/// Send multiple SSDP M-SEARCH probes and collect TV responses (~5 seconds).
+///
+/// Different TV brands require different SSDP search targets:
+///   - LG/Samsung: respond to `ssdp:all`
+///   - Sony Bravia: requires `urn:schemas-sony-com:service:ScalarWebAPI:1`
+///   - Roku: uses `roku:ecp`
+///
+/// Each probe is sent twice (UDP is unreliable, especially on WiFi).
 pub async fn discover_tvs(stack: Stack<'static>) -> heapless::Vec<DiscoveredTv, 8> {
     let mut results: heapless::Vec<DiscoveredTv, 8> = heapless::Vec::new();
 
@@ -147,14 +169,41 @@ pub async fn discover_tvs(stack: Stack<'static>) -> heapless::Vec<DiscoveredTv, 
         return results;
     }
 
-    let msearch = b"M-SEARCH * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n";
-
     let dest = IpEndpoint::new(IpAddress::v4(239, 255, 255, 250), 1900);
-    let _ = socket.send_to(msearch, dest).await;
 
-    // Collect responses for 3 seconds
-    let deadline = embassy_time::Instant::now() + Duration::from_secs(3);
+    // Brand-specific search targets
+    const SEARCH_TARGETS: &[&str] = &[
+        "ssdp:all",                                              // LG, Samsung, general
+        "urn:schemas-sony-com:service:ScalarWebAPI:1",           // Sony Bravia
+        "roku:ecp",                                              // Roku
+        "urn:dial-multiscreen-org:service:dial:1",               // DIAL (many smart TVs)
+    ];
+
+    // Send each M-SEARCH twice for reliability (UDP packet loss on WiFi)
+    for st in SEARCH_TARGETS {
+        for _ in 0..2 {
+            let mut pkt: heapless::String<256> = heapless::String::new();
+            let _ = core::write!(
+                pkt,
+                "M-SEARCH * HTTP/1.1\r\n\
+                 HOST: 239.255.255.250:1900\r\n\
+                 MAN: \"ssdp:discover\"\r\n\
+                 MX: 3\r\n\
+                 ST: {}\r\n\r\n",
+                st
+            );
+            let _ = socket.send_to(pkt.as_bytes(), dest).await;
+            Timer::after(Duration::from_millis(100)).await;
+        }
+    }
+
+    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+        "ssdp: sent {} probes ({}×2)", SEARCH_TARGETS.len(), SEARCH_TARGETS.len());
+
+    // Collect responses for 5 seconds
+    let deadline = embassy_time::Instant::now() + Duration::from_secs(5);
     let mut resp_buf = [0u8; 512];
+    let mut rx_count: u32 = 0;
 
     loop {
         let remaining = deadline.saturating_duration_since(embassy_time::Instant::now());
@@ -162,29 +211,7 @@ pub async fn discover_tvs(stack: Stack<'static>) -> heapless::Vec<DiscoveredTv, 
 
         match with_timeout(remaining, socket.recv_from(&mut resp_buf)).await {
             Ok(Ok((n, from))) => {
-                let resp = core::str::from_utf8(&resp_buf[..n]).unwrap_or("");
-
-                // Determine brand from SSDP response (case-insensitive byte scan)
-                let brand = {
-                    // Check for brand keywords case-insensitively without alloc
-                    let has = |kw: &[u8]| {
-                        resp_buf[..n].windows(kw.len()).any(|w| {
-                            w.iter().zip(kw).all(|(a, b)| a.to_ascii_lowercase() == *b)
-                        })
-                    };
-                    if has(b"webos") || has(b"lg") {
-                        "lg"
-                    } else if has(b"samsung") {
-                        "samsung"
-                    } else if has(b"sony") || has(b"bravia") {
-                        "sony"
-                    } else if has(b"roku") {
-                        "roku"
-                    } else {
-                        continue; // Not a TV we support
-                    }
-                };
-
+                rx_count += 1;
                 let ip_str = {
                     let addr = from.endpoint.addr;
                     let mut s: heapless::String<16> = heapless::String::new();
@@ -192,12 +219,51 @@ pub async fn discover_tvs(stack: Stack<'static>) -> heapless::Vec<DiscoveredTv, 
                     s
                 };
 
+                let resp = core::str::from_utf8(&resp_buf[..n]).unwrap_or("");
+
+                // Extract ST and SERVER headers for logging and brand detection
+                let st_hdr = extract_ssdp_field(resp, "ST:");
+                let server_hdr = extract_ssdp_field(resp, "SERVER:");
+
+                // Log received packet with key headers (fits in 128-byte dev_log)
+                dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                    "ssdp rx#{} {} ST={}", rx_count, ip_str.as_str(),
+                    st_hdr.unwrap_or("?"));
+                dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                    "ssdp rx#{} SVR={}", rx_count,
+                    server_hdr.unwrap_or("(none)"));
+
+                // Determine brand — first check ST header (most reliable),
+                // then fall back to keyword scan of the full response body.
+                let has = |kw: &[u8]| {
+                    resp_buf[..n].windows(kw.len()).any(|w| {
+                        w.iter().zip(kw).all(|(a, b)| a.to_ascii_lowercase() == *b)
+                    })
+                };
+
+                let brand = if has(b"schemas-sony-com") || has(b"sony") || has(b"bravia") || has(b"scalarwebapi") {
+                    "sony"
+                } else if has(b"webos") || has(b"lge") || (has(b"lg") && has(b"tv")) {
+                    "lg"
+                } else if has(b"samsung") || has(b"tizen") {
+                    "samsung"
+                } else if has(b"roku") {
+                    "roku"
+                } else if has(b"dial-multiscreen") {
+                    // DIAL response without brand keywords — could be any smart TV.
+                    // Include it as "unknown" so the user can at least see the IP.
+                    "unknown"
+                } else {
+                    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Warn,
+                        "ssdp: skip {}", ip_str.as_str());
+                    continue;
+                };
+
                 // Deduplicate by IP
                 if results.iter().any(|r| r.ip == ip_str) { continue; }
 
-                // Extract friendly name from SERVER header (case-insensitive)
-                let name = extract_ssdp_field(resp, "SERVER:")
-                    .unwrap_or(brand);
+                // Extract friendly name
+                let name = server_hdr.unwrap_or(brand);
 
                 let mut tv = DiscoveredTv {
                     ip: ip_str,
@@ -206,14 +272,139 @@ pub async fn discover_tvs(stack: Stack<'static>) -> heapless::Vec<DiscoveredTv, 
                 };
                 let _ = tv.name.push_str(&name[..name.len().min(47)]);
                 let _ = tv.brand.push_str(brand);
+
+                dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                    "ssdp: MATCH {} @ {}", brand, tv.ip.as_str());
+
                 let _ = results.push(tv);
             }
-            _ => break,
+            Ok(Err(_)) => {
+                dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Warn,
+                    "ssdp: recv error, continuing");
+                continue;
+            }
+            Err(_) => break, // Timeout — deadline reached
         }
     }
 
-    // Leave SSDP multicast group
+    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+        "ssdp: multicast done, {} rx, {} found", rx_count, results.len());
+
+    // Leave SSDP multicast group (done with multicast phase)
     let _ = stack.leave_multicast_group(embassy_net::Ipv4Address::new(239, 255, 255, 250));
+
+    // ── Phase 2: Unicast sweep on nearby subnets ──────────────────────────
+    // Multicast doesn't cross VLANs, but unicast routing often does.
+    // Send M-SEARCH directly to each IP on common home subnets.
+    let own_octets = stack.config_v4().map(|c| c.address.address().octets());
+    if let Some(own) = own_octets {
+        // Build list of /24 prefixes to sweep (skip our own subnet — already covered by multicast)
+        let mut subnets: heapless::Vec<[u8; 3], 4> = heapless::Vec::new();
+        const COMMON_PREFIXES: &[[u8; 3]] = &[
+            [192, 168, 1],
+            [192, 168, 0],
+            [10, 0, 0],
+            [10, 0, 1],
+        ];
+        for prefix in COMMON_PREFIXES {
+            if prefix[0] == own[0] && prefix[1] == own[1] && prefix[2] == own[2] {
+                continue; // Skip our own subnet
+            }
+            let _ = subnets.push(*prefix);
+        }
+
+        if !subnets.is_empty() {
+            dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                "ssdp: unicast sweep on {} subnets", subnets.len());
+
+            // Reuse the same socket — send unicast M-SEARCH to each host
+            let search = "M-SEARCH * HTTP/1.1\r\n\
+                          HOST: 239.255.255.250:1900\r\n\
+                          MAN: \"ssdp:discover\"\r\n\
+                          MX: 1\r\nST: ssdp:all\r\n\r\n";
+
+            for prefix in &subnets {
+                for host in 1u8..=254 {
+                    let dest = IpEndpoint::new(
+                        IpAddress::v4(prefix[0], prefix[1], prefix[2], host),
+                        1900,
+                    );
+                    let _ = socket.send_to(search.as_bytes(), dest).await;
+                    // Small yield every 16 hosts to not starve other tasks
+                    if host % 16 == 0 {
+                        Timer::after(Duration::from_millis(1)).await;
+                    }
+                }
+            }
+
+            dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                "ssdp: unicast probes sent, collecting...");
+
+            // Collect unicast responses for 4 more seconds
+            let deadline2 = embassy_time::Instant::now() + Duration::from_secs(4);
+            loop {
+                let remaining = deadline2.saturating_duration_since(embassy_time::Instant::now());
+                if remaining.as_millis() == 0 { break; }
+
+                match with_timeout(remaining, socket.recv_from(&mut resp_buf)).await {
+                    Ok(Ok((n, from))) => {
+                        rx_count += 1;
+                        let ip_str = {
+                            let addr = from.endpoint.addr;
+                            let mut s: heapless::String<16> = heapless::String::new();
+                            let _ = core::write!(s, "{}", addr);
+                            s
+                        };
+
+                        // Skip if already found in multicast phase
+                        if results.iter().any(|r| r.ip == ip_str) { continue; }
+
+                        let resp = core::str::from_utf8(&resp_buf[..n]).unwrap_or("");
+                        let server_hdr = extract_ssdp_field(resp, "SERVER:");
+
+                        let has = |kw: &[u8]| {
+                            resp_buf[..n].windows(kw.len()).any(|w| {
+                                w.iter().zip(kw).all(|(a, b)| a.to_ascii_lowercase() == *b)
+                            })
+                        };
+
+                        let brand = if has(b"schemas-sony-com") || has(b"sony") || has(b"bravia") || has(b"scalarwebapi") {
+                            "sony"
+                        } else if has(b"webos") || has(b"lge") || (has(b"lg") && has(b"tv")) {
+                            "lg"
+                        } else if has(b"samsung") || has(b"tizen") {
+                            "samsung"
+                        } else if has(b"roku") {
+                            "roku"
+                        } else if has(b"dial-multiscreen") {
+                            "unknown"
+                        } else {
+                            continue;
+                        };
+
+                        let name = server_hdr.unwrap_or(brand);
+                        let mut tv = DiscoveredTv {
+                            ip: ip_str,
+                            name: heapless::String::new(),
+                            brand: heapless::String::new(),
+                        };
+                        let _ = tv.name.push_str(&name[..name.len().min(47)]);
+                        let _ = tv.brand.push_str(brand);
+
+                        dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+                            "ssdp(uni): MATCH {} @ {}", brand, tv.ip.as_str());
+
+                        let _ = results.push(tv);
+                    }
+                    Ok(Err(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Info,
+        "ssdp: total {} TVs found", results.len());
 
     info!("[tv] SSDP discovered {} TVs", results.len());
     results
@@ -255,7 +446,7 @@ pub async fn tv_task(
         if !config.is_configured() {
             TV_STATUS.store(0, portable_atomic::Ordering::Relaxed);
             info!("[tv] No TV configured. Waiting…");
-            Timer::after(Duration::from_secs(10)).await;
+            wait_or_wake(Duration::from_secs(10)).await;
             continue;
         }
 
@@ -269,7 +460,7 @@ pub async fn tv_task(
             None => {
                 TV_STATUS.store(3, portable_atomic::Ordering::Relaxed);
                 warn!("[tv] Invalid IP: {}", config.ip.as_str());
-                Timer::after(Duration::from_secs(30)).await;
+                wait_or_wake(Duration::from_secs(10)).await;
                 continue;
             }
         };
@@ -280,14 +471,18 @@ pub async fn tv_task(
             "connecting {}:{} brand={:?}", config.ip.as_str(), tv_port, config.brand);
 
         let mut socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-        socket.set_timeout(Some(Duration::from_secs(15)));
+        socket.set_timeout(Some(Duration::from_secs(5)));
 
         if let Err(_e) = socket.connect(tv_addr).await {
-            TV_STATUS.store(3, portable_atomic::Ordering::Relaxed);
+            // Only set error if config hasn't changed while we were connecting
+            let current_ip = { tv_config.lock().await.ip.clone() };
+            if current_ip == config.ip {
+                TV_STATUS.store(3, portable_atomic::Ordering::Relaxed);
+            }
             dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Error,
                 "tcp_fail {}:{}", config.ip.as_str(), tv_port);
-            warn!("[tv] TCP connect failed — retry in 15s");
-            Timer::after(Duration::from_secs(15)).await;
+            warn!("[tv] TCP connect failed");
+            wait_or_wake(Duration::from_secs(5)).await;
             continue;
         }
 
@@ -357,11 +552,14 @@ pub async fn tv_task(
         };
 
         if !connected {
-            TV_STATUS.store(3, portable_atomic::Ordering::Relaxed);
+            let current_ip = { tv_config.lock().await.ip.clone() };
+            if current_ip == config.ip {
+                TV_STATUS.store(3, portable_atomic::Ordering::Relaxed);
+            }
             dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Warn,
                 "handshake fail {:?}", config.brand);
-            warn!("[tv] Handshake failed — retry in 10s");
-            Timer::after(Duration::from_secs(10)).await;
+            warn!("[tv] Handshake failed");
+            wait_or_wake(Duration::from_secs(5)).await;
             continue;
         }
 
@@ -411,7 +609,7 @@ pub async fn tv_task(
                 if !ok { break 'cmd; }
             }
             TV_STATUS.store(1, portable_atomic::Ordering::Relaxed);
-            Timer::after(Duration::from_secs(5)).await;
+            wait_or_wake(Duration::from_secs(2)).await;
         } else {
             // ── HTTP path (Sony, Roku) — fresh socket per command ─────────
             // Drop the handshake socket so we can create fresh ones per cmd.
@@ -427,13 +625,16 @@ pub async fn tv_task(
                     break 'cmd;
                 }
 
-                // No keepalive needed — we reconnect per command.
-                let cmd = DUCK_CHANNEL.receive().await;
+                // Wait for duck command with timeout so we periodically check config
+                let cmd = match with_timeout(Duration::from_secs(30), DUCK_CHANNEL.receive()).await {
+                    Ok(cmd) => cmd,
+                    Err(_) => continue, // Timeout — loop back to check config
+                };
                 if let DuckCommand::None = cmd { continue; }
 
                 // Fresh TCP socket for this command
                 let mut cmd_socket = TcpSocket::new(stack, &mut rx_buf, &mut tx_buf);
-                cmd_socket.set_timeout(Some(Duration::from_secs(10)));
+                cmd_socket.set_timeout(Some(Duration::from_secs(5)));
 
                 if let Err(_) = cmd_socket.connect(tv_addr).await {
                     dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Error,
@@ -783,7 +984,7 @@ async fn samsung_key(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], key: &str)
 
 async fn sony_get_volume(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &TvConfig) -> Option<u8> {
     const BODY: &str = r#"{"method":"getVolumeInformation","id":33,"params":[],"version":"1.0"}"#;
-    let resp_bytes = sony_http_post(socket, out, &cfg.ip, &cfg.sony_psk, BODY).await?;
+    let resp_bytes = sony_http_post(socket, out, &cfg.ip, &cfg.sony_psk, "/sony/audio", BODY).await?;
     let resp = core::str::from_utf8(resp_bytes).ok()?;
     let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
     let body = &resp[body_start..];
@@ -802,16 +1003,19 @@ async fn sony_set_volume(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &
         r#"{{"method":"setAudioVolume","id":98,"params":[{{"target":"speaker","volume":"{}"}}],"version":"1.2"}}"#,
         vol
     );
-    sony_http_post(socket, out, &cfg.ip, &cfg.sony_psk, body.as_str()).await.is_some()
+    sony_http_post(socket, out, &cfg.ip, &cfg.sony_psk, "/sony/audio", body.as_str()).await.is_some()
 }
 
+/// Step Sony volume by exactly 1 using relative volume strings ("+1" / "-1").
 async fn sony_volume_step(socket: &mut TcpSocket<'_>, out: &mut [u8; 512], cfg: &TvConfig, up: bool) -> bool {
-    if let Some(vol) = sony_get_volume(socket, out, cfg).await {
-        let new_vol = if up { vol.saturating_add(1).min(100) } else { vol.saturating_sub(1) };
-        sony_set_volume(socket, out, cfg, new_vol).await
-    } else {
-        false
-    }
+    let vol_str = if up { "+1" } else { "-1" };
+    let mut body: heapless::String<128> = heapless::String::new();
+    let _ = core::write!(
+        body,
+        r#"{{"method":"setAudioVolume","id":98,"params":[{{"target":"speaker","volume":"{}"}}],"version":"1.0"}}"#,
+        vol_str
+    );
+    sony_http_post(socket, out, &cfg.ip, &cfg.sony_psk, "/sony/audio", body.as_str()).await.is_some()
 }
 
 async fn sony_http_post<'b>(
@@ -819,19 +1023,20 @@ async fn sony_http_post<'b>(
     out: &'b mut [u8; 512],
     ip: &str,
     psk: &str,
+    path: &str,
     body: &str,
 ) -> Option<&'b [u8]> {
     let mut headers: heapless::String<256> = heapless::String::new();
     let _ = core::write!(
         headers,
-        "POST /sony/audio HTTP/1.1\r\n\
+        "POST {} HTTP/1.1\r\n\
          Host: {}\r\n\
          Content-Type: application/json\r\n\
          X-Auth-PSK: {}\r\n\
          Content-Length: {}\r\n\
          Connection: keep-alive\r\n\
          \r\n",
-        ip, psk, body.len()
+        path, ip, psk, body.len()
     );
     socket.write_all(headers.as_bytes()).await.ok()?;
     socket.write_all(body.as_bytes()).await.ok()?;

@@ -405,8 +405,6 @@ pub async fn download_update(
             // First request — get the status and detect redirects
             let mut resp_buf = [0u8; 4096];
             let mut redirect_url_buf: heapless::String<256> = heapless::String::new();
-            let mut got_redirect = false;
-
             {
                 let req = asset_client.request(Method::GET, download_url).await.map_err(|_| ())?;
                 let mut req_h = req.headers(&[("User-Agent", "Guardian/0.3")]);
@@ -422,7 +420,6 @@ pub async fn download_update(
                         .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
                     {
                         let _ = redirect_url_buf.push_str(&loc[..loc.len().min(255)]);
-                        got_redirect = true;
                     } else {
                         warn!("[ota] 302 but no Location header for {}", name);
                         return Err(());
@@ -453,7 +450,7 @@ pub async fn download_update(
             }
             // asset_client borrow released here
 
-            if got_redirect {
+            if !redirect_url_buf.is_empty() {
                 info!("[ota] Following redirect for {}", name);
                 let mut redir_tls_r = [0u8; 16384];
                 let mut redir_tls_w = [0u8; 16384];

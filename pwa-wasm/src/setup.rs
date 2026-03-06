@@ -37,6 +37,8 @@ pub fn SetupWizard(
     let on_dismiss = StoredValue::new_local(on_dismiss);
     let on_tab     = StoredValue::new_local(on_tab);
     let (step, set_step) = signal(step_from_u8(initial_step));
+    let (cal_done, set_cal_done) = signal(false);
+    let (tv_done, set_tv_done)   = signal(false);
 
     view! {
         <div style="position:fixed;inset:0;background:#0f172a;z-index:1000;\
@@ -87,6 +89,7 @@ pub fn SetupWizard(
                             </div>
                             <button
                                 on:click=move |_| {
+                                    set_cal_done.set(true);
                                     on_tab.with_value(|f| f("cal", 2)); // next: Tv step
                                 }
                                 style="padding:14px;border-radius:12px;border:none;\
@@ -104,7 +107,10 @@ pub fn SetupWizard(
                                 "Skip for now"
                             </button>
                             <button
-                                on:click=move |_| set_step.set(Step::Tv)
+                                on:click=move |_| {
+                                    set_cal_done.set(true);
+                                    set_step.set(Step::Tv);
+                                }
                                 style="padding:12px;border-radius:12px;border:1px solid #334155;\
                                        background:#1e293b;color:#f1f5f9;font-size:14px;\
                                        font-weight:600;cursor:pointer"
@@ -126,6 +132,7 @@ pub fn SetupWizard(
                             </div>
                             <button
                                 on:click=move |_| {
+                                    set_tv_done.set(true);
                                     on_tab.with_value(|f| f("tv", 3)); // next: Done step
                                 }
                                 style="padding:14px;border-radius:12px;border:none;\
@@ -143,7 +150,10 @@ pub fn SetupWizard(
                                 "Skip for now"
                             </button>
                             <button
-                                on:click=move |_| set_step.set(Step::Done)
+                                on:click=move |_| {
+                                    set_tv_done.set(true);
+                                    set_step.set(Step::Done);
+                                }
                                 style="padding:12px;border-radius:12px;border:1px solid #334155;\
                                        background:#1e293b;color:#f1f5f9;font-size:14px;\
                                        font-weight:600;cursor:pointer"
@@ -153,28 +163,44 @@ pub fn SetupWizard(
                         </div>
                     }.into_any(),
 
-                    Step::Done => view! {
-                        <div style="flex:1;display:flex;flex-direction:column;\
-                                    justify-content:center;gap:20px;text-align:center">
-                            <div style="font-size:48px">"🎉"</div>
-                            <div style="font-size:26px;font-weight:700">"You're All Set!"</div>
-                            <div style="color:#94a3b8;font-size:15px;line-height:1.5">
-                                "Tap the button below to arm Guardian. "
-                                "It will automatically duck the TV volume when "
-                                "sustained loud noise is detected."
+                    Step::Done => {
+                        let both_skipped = !cal_done.get_untracked() && !tv_done.get_untracked();
+                        let any_skipped = !cal_done.get_untracked() || !tv_done.get_untracked();
+                        let (title, msg) = if both_skipped {
+                            ("Setup Incomplete",
+                             "Calibration and TV setup were skipped. Open the Calibrate and TV tabs to finish.")
+                        } else if any_skipped {
+                            ("Almost There!",
+                             if !cal_done.get_untracked() {
+                                 "Calibration was skipped. Open the Calibrate tab to complete setup."
+                             } else {
+                                 "TV setup was skipped. Open the TV tab to connect your TV."
+                             })
+                        } else {
+                            ("You're All Set!",
+                             "Tap the button below to arm Guardian. It will automatically duck the TV volume when sustained loud noise is detected.")
+                        };
+                        view! {
+                            <div style="flex:1;display:flex;flex-direction:column;\
+                                        justify-content:center;gap:20px;text-align:center">
+                                <div style="font-size:48px">{if both_skipped { "\u{26A0}\u{FE0F}" } else { "\u{1F389}" }}</div>
+                                <div style="font-size:26px;font-weight:700">{title}</div>
+                                <div style="color:#94a3b8;font-size:15px;line-height:1.5">
+                                    {msg}
+                                </div>
+                                <button
+                                    on:click=move |_| {
+                                        crate::local_set("setup_done", "true");
+                                        on_dismiss.with_value(|f| f());
+                                    }
+                                    style="margin-top:16px;padding:16px;border-radius:14px;border:none;\
+                                           background:#16a34a;color:white;font-size:17px;\
+                                           font-weight:700;cursor:pointer"
+                                >
+                                    "Finish Setup"
+                                </button>
                             </div>
-                            <button
-                                on:click=move |_| {
-                                    crate::local_set("setup_done", "true");
-                                    on_dismiss.with_value(|f| f());
-                                }
-                                style="margin-top:16px;padding:16px;border-radius:14px;border:none;\
-                                       background:#16a34a;color:white;font-size:17px;\
-                                       font-weight:700;cursor:pointer"
-                            >
-                                "Finish Setup"
-                            </button>
-                        </div>
+                        }
                     }.into_any(),
                 }}
             </div>

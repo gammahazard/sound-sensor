@@ -235,6 +235,53 @@ fn parse_json_str_missing() {
     assert_eq!(parse_json_str(s, "\"token\":"), None);
 }
 
+// ── push_json_escaped ──────────────────────────────────────────────────────
+
+#[test]
+fn json_escape_clean() {
+    let mut out: heapless::String<64> = heapless::String::new();
+    push_json_escaped(&mut out, "hello");
+    assert_eq!(out.as_str(), "hello");
+}
+
+#[test]
+fn json_escape_quotes() {
+    let mut out: heapless::String<64> = heapless::String::new();
+    push_json_escaped(&mut out, r#"say "hi""#);
+    assert_eq!(out.as_str(), r#"say \"hi\""#);
+}
+
+#[test]
+fn json_escape_backslash() {
+    let mut out: heapless::String<64> = heapless::String::new();
+    push_json_escaped(&mut out, r#"path\to"#);
+    assert_eq!(out.as_str(), r#"path\\to"#);
+}
+
+#[test]
+fn json_escape_both() {
+    let mut out: heapless::String<64> = heapless::String::new();
+    push_json_escaped(&mut out, r#"a\"b"#);
+    assert_eq!(out.as_str(), r#"a\\\"b"#);
+}
+
+#[test]
+fn json_escape_empty() {
+    let mut out: heapless::String<64> = heapless::String::new();
+    push_json_escaped(&mut out, "");
+    assert_eq!(out.as_str(), "");
+}
+
+#[test]
+fn json_escape_roundtrip() {
+    // Escape then unescape should return original
+    let original = r#"my"pass\word"#;
+    let mut escaped: heapless::String<64> = heapless::String::new();
+    push_json_escaped(&mut escaped, original);
+    let unescaped = json_unescape(escaped.as_str());
+    assert_eq!(unescaped.as_str(), original);
+}
+
 // ── parse_str_field structural position ─────────────────────────────────────
 
 #[test]

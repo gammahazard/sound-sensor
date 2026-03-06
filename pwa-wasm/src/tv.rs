@@ -158,7 +158,7 @@ pub fn TvScreen(
                          cursor:pointer;transition:all 0.15s",
                         if brand_sel.get() == key { "#6366f1" } else { "#334155" },
                         if brand_sel.get() == key { "#312e81" } else { "transparent" },
-                        if brand_sel.get() == key { "#c7d2fe" } else { "#94a3b8" },
+                        if brand_sel.get() == key { "#e0e7ff" } else { "#94a3b8" },
                     )
                 >
                     {label}
@@ -184,10 +184,10 @@ pub fn TvScreen(
                     on:click=move |_| {
                         set_discovering.set(true);
                         on_discover.with_value(|f| f());
-                        // Auto-reset after 4s
+                        // Auto-reset after 14s (multicast 5s + unicast sweep + 4s collect)
                         let set_d = set_discovering.clone();
                         wasm_bindgen_futures::spawn_local(async move {
-                            gloo_timers::future::TimeoutFuture::new(4_000).await;
+                            gloo_timers::future::TimeoutFuture::new(14_000).await;
                             set_d.set(false);
                         });
                     }
@@ -204,7 +204,12 @@ pub fn TvScreen(
 
                 // Discovered TV list
                 {move || {
-                    let tvs = discovered_tvs.get();
+                    let all_tvs = discovered_tvs.get();
+                    // Deduplicate by IP
+                    let mut seen = Vec::new();
+                    let tvs: Vec<_> = all_tvs.into_iter().filter(|tv| {
+                        if seen.contains(&tv.ip) { false } else { seen.push(tv.ip.clone()); true }
+                    }).collect();
                     if tvs.is_empty() { return ().into_any(); }
                     view! {
                         <div style="display:flex;flex-direction:column;gap:6px">
@@ -263,7 +268,7 @@ pub fn TvScreen(
                         <label style="font-size:12px;color:#94a3b8">"Sony Pre-Shared Key"</label>
                         <input
                             id="tv-psk-input"
-                            type="text"
+                            type="password"
                             inputmode="numeric"
                             placeholder="e.g. 1234"
                             maxlength="8"
@@ -333,10 +338,19 @@ pub fn TvScreen(
                             return;
                         }
 
-                        let msg = if brand == "samsung" {
-                            format!("Connecting to {}… (approve on TV screen)", ip)
-                        } else {
-                            format!("Connecting to {}…", ip)
+                        // Build connect message, with subnet warning if applicable
+                        let subnet_warn = subnet_mismatch_warning(&ip);
+                        let msg = {
+                            let base = if brand == "samsung" {
+                                format!("Connecting to {}… (approve on TV screen)", ip)
+                            } else {
+                                format!("Connecting to {}…", ip)
+                            };
+                            if let Some(warn) = subnet_warn {
+                                format!("{} ⚠ {}", base, warn)
+                            } else {
+                                base
+                            }
                         };
                         set_result.set(msg);
                         set_result_ok.set(true);
@@ -400,6 +414,37 @@ fn is_valid_ip(s: &str) -> bool {
     parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok())
 }
 
+/// Returns a warning message if the TV IP is on a different subnet than the Pico.
+fn subnet_mismatch_warning(tv_ip: &str) -> Option<String> {
+    let pico_host = web_sys::window()
+        .and_then(|w| w.location().hostname().ok())
+        .unwrap_or_default();
+
+    // Only compare if both are valid IPs (skip if using .local hostname)
+    let pico_prefix = ip_prefix(&pico_host)?;
+    let tv_prefix = ip_prefix(tv_ip)?;
+
+    if pico_prefix != tv_prefix {
+        Some(format!(
+            "Different network: TV is on {}.x, Guardian is on {}.x",
+            tv_prefix, pico_prefix
+        ))
+    } else {
+        None
+    }
+}
+
+/// Extract the first 3 octets of an IP address (e.g. "192.168.1").
+/// Returns None if the string isn't a valid IP.
+fn ip_prefix(ip: &str) -> Option<String> {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+        Some(format!("{}.{}.{}", parts[0], parts[1], parts[2]))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +492,37 @@ mod tests {
     #[test]
     fn is_valid_ip_negative() {
         assert!(!is_valid_ip("192.168.1.-1"));
+    }
+
+    // ── ip_prefix ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn ip_prefix_valid() {
+        assert_eq!(ip_prefix("192.168.1.100"), Some("192.168.1".to_string()));
+    }
+
+    #[test]
+    fn ip_prefix_zeros() {
+        assert_eq!(ip_prefix("0.0.0.0"), Some("0.0.0".to_string()));
+    }
+
+    #[test]
+    fn ip_prefix_invalid_too_few() {
+        assert_eq!(ip_prefix("192.168.1"), None);
+    }
+
+    #[test]
+    fn ip_prefix_invalid_letters() {
+        assert_eq!(ip_prefix("abc.def.ghi.jkl"), None);
+    }
+
+    #[test]
+    fn ip_prefix_hostname() {
+        assert_eq!(ip_prefix("guardian.local"), None);
+    }
+
+    #[test]
+    fn ip_prefix_empty() {
+        assert_eq!(ip_prefix(""), None);
     }
 }

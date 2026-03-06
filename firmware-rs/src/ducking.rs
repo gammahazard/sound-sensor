@@ -95,7 +95,7 @@ impl DuckingEngine {
     /// Call every 100 ms with the latest dBFS reading.
     /// Returns what action (if any) the TV task should take.
     pub fn tick(&mut self, db: f32) -> DuckCommand {
-        if db.is_nan() {
+        if !db.is_finite() {
             return DuckCommand::None;
         }
         if !self.armed {

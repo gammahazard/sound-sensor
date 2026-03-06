@@ -36,19 +36,23 @@ pub async fn http_task(stack: Stack<'static>) {
             continue;
         }
 
-        handle_request(&mut socket).await;
+        // Keep-alive loop: serve multiple requests per TCP connection
+        loop {
+            socket.set_timeout(Some(Duration::from_secs(5))); // idle timeout
+            let keep = handle_one_request(&mut socket).await;
+            if !keep { break; }
+        }
     }
 }
 
-async fn handle_request(socket: &mut TcpSocket<'_>) {
+/// Handle one HTTP request on an existing connection.
+/// Returns `true` to keep the connection alive, `false` to close it.
+async fn handle_one_request(socket: &mut TcpSocket<'_>) -> bool {
     // 512 bytes — iOS Safari sends ~350 bytes of headers (User-Agent alone is 100+)
     let mut buf = [0u8; 512];
     let len = match read_until_double_crlf(socket, &mut buf).await {
         Some(n) => n,
-        None => {
-            let _ = send_error(socket, 400, "Bad Request").await;
-            return;
-        }
+        None => return false, // client closed or timeout — drop connection
     };
 
     let request = core::str::from_utf8(&buf[..len]).unwrap_or("");
@@ -59,6 +63,9 @@ async fn handle_request(socket: &mut TcpSocket<'_>) {
     let path   = parts.next().unwrap_or("/");
 
     info!("[http] {} {}", method, path);
+
+    // Extend timeout for response transfer
+    socket.set_timeout(Some(Duration::from_secs(30)));
 
     // In AP mode: captive portal — serve setup page for ALL GET requests.
     // iOS probes captive.apple.com/hotspot-detect.html expecting "Success" text.
@@ -72,7 +79,7 @@ async fn handle_request(socket: &mut TcpSocket<'_>) {
         } else {
             send_error(socket, 404, "Not Found").await;
         }
-        return;
+        return false; // AP mode: close after each request (captive portal compat)
     }
 
     // Snapshot the OTA file table (non-blocking try_lock to avoid contention)
@@ -141,8 +148,11 @@ async fn handle_request(socket: &mut TcpSocket<'_>) {
         }
         _ => {
             send_error(socket, 404, "Not Found").await;
+            return false;
         }
     }
+
+    true // keep connection alive for next request
 }
 
 // ── Unified response body types ──────────────────────────────────────────────
@@ -169,7 +179,7 @@ async fn serve_response(socket: &mut TcpSocket<'_>, content_type: &str, body: Se
     if gzip {
         let _ = headers.push_str("Content-Encoding: gzip\r\n");
     }
-    let _ = headers.push_str("Cache-Control: no-cache\r\nConnection: close\r\n\r\n");
+    let _ = headers.push_str("Cache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n");
 
     if socket.write_all(headers.as_bytes()).await.is_err() { return; }
 

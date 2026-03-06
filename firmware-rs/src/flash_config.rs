@@ -12,7 +12,8 @@
 //!   Byte  174:     calibration_valid (0=no, 1=yes)
 //!   Bytes 175–178: floor_db (f32 LE)
 //!   Bytes 179–182: tripwire_db (f32 LE)
-//!   Bytes 183–251: reserved
+//!   Bytes 183–188: tv_mac (6 bytes, for Wake-on-LAN)
+//!   Bytes 189–251: reserved
 //!   Bytes 252–255: CRC32 over bytes 0–251
 
 use defmt::*;
@@ -72,16 +73,19 @@ fn is_valid(buf: &[u8; 256]) -> bool {
     crc32(&buf[..252]) == stored_crc
 }
 
-/// Compute CRC, erase sector, write block. Logs on failure.
-fn write_config_block(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, buf: &mut [u8; 256], label: &str) {
+/// Compute CRC, erase sector, write block. Returns false if erase or write failed.
+fn write_config_block(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, buf: &mut [u8; 256], label: &str) -> bool {
     let crc = crc32(&buf[..252]);
     buf[252..256].copy_from_slice(&crc.to_le_bytes());
     if flash.blocking_erase(CONFIG_OFFSET, CONFIG_OFFSET + 4096).is_err() {
         warn!("[flash] erase failed ({})", label);
+        return false;
     }
     if flash.blocking_write(CONFIG_OFFSET, buf).is_err() {
         warn!("[flash] write failed ({})", label);
+        return false;
     }
+    true
 }
 
 // ── WiFi credentials ────────────────────────────────────────────────────────
@@ -99,7 +103,7 @@ pub fn flash_load_creds(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>) -> O
     Some((ssid, pass))
 }
 
-pub fn flash_save_creds(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, ssid: &str, pass: &str) {
+pub fn flash_save_creds(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, ssid: &str, pass: &str) -> bool {
     let mut buf = [0u8; 256];
     let _ = flash.blocking_read(CONFIG_OFFSET, &mut buf);
     validate_or_fresh(&mut buf);
@@ -111,7 +115,7 @@ pub fn flash_save_creds(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, ssid
     buf[68..132].fill(0);
     let pass_bytes = pass.as_bytes();
     buf[68..68 + pass_bytes.len().min(63)].copy_from_slice(&pass_bytes[..pass_bytes.len().min(63)]);
-    write_config_block(flash, &mut buf, "save_creds");
+    write_config_block(flash, &mut buf, "save_creds")
 }
 
 /// Clear only WiFi credentials (bytes 4–131), preserving TV config + calibration.
@@ -161,7 +165,7 @@ pub fn flash_save_tv_config(flash: &mut Flash<'_, FLASH, Blocking, FLASH_SIZE>, 
     buf[149] = tv.brand.to_u8();
     buf[150..166].fill(0);
     let tok_bytes = tv.samsung_token.as_bytes();
-    buf[150..150 + tok_bytes.len().min(16)].copy_from_slice(&tok_bytes[..tok_bytes.len().min(16)]);
+    buf[150..150 + tok_bytes.len().min(15)].copy_from_slice(&tok_bytes[..tok_bytes.len().min(15)]);
     buf[166..174].fill(0);
     let psk_bytes = tv.sony_psk.as_bytes();
     buf[166..166 + psk_bytes.len().min(8)].copy_from_slice(&psk_bytes[..psk_bytes.len().min(8)]);

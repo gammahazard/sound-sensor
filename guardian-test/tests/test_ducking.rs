@@ -443,3 +443,46 @@ fn clear_duck_state_guarded_by_restoring() {
     assert!(eng.armed);
     assert_eq!(eng.state(), DuckingState::Quiet);
 }
+
+// ── Infinity tests ─────────────────────────────────────────────────────────
+
+#[test]
+fn positive_infinity_returns_none() {
+    let mut eng = DuckingEngine::new(-20.0, -60.0);
+    eng.arm();
+    let cmd = eng.tick_at(f32::INFINITY, 0);
+    assert_eq!(cmd, DuckCommand::None);
+    assert_eq!(eng.sustained_ms(), 0);
+}
+
+#[test]
+fn negative_infinity_returns_none() {
+    let mut eng = DuckingEngine::new(-20.0, -60.0);
+    eng.arm();
+    let cmd = eng.tick_at(f32::NEG_INFINITY, 0);
+    assert_eq!(cmd, DuckCommand::None);
+    assert_eq!(eng.sustained_ms(), 0);
+}
+
+#[test]
+fn infinity_preserves_ducking_state() {
+    let mut eng = DuckingEngine::new(-20.0, -60.0);
+    eng.arm();
+    let (_, t) = run_ticks(&mut eng, -10.0, 30, 0);
+    assert_eq!(eng.state(), DuckingState::Ducking);
+    // +inf during ducking should not change state or trigger restore
+    let cmd = eng.tick_at(f32::INFINITY, t);
+    assert_eq!(cmd, DuckCommand::None);
+    assert_eq!(eng.state(), DuckingState::Ducking);
+}
+
+#[test]
+fn neg_infinity_preserves_ducking_state() {
+    let mut eng = DuckingEngine::new(-20.0, -60.0);
+    eng.arm();
+    let (_, t) = run_ticks(&mut eng, -10.0, 30, 0);
+    assert_eq!(eng.state(), DuckingState::Ducking);
+    let cmd = eng.tick_at(f32::NEG_INFINITY, t);
+    assert_eq!(cmd, DuckCommand::None);
+    assert_eq!(eng.state(), DuckingState::Ducking);
+}

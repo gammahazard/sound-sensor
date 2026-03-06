@@ -8,6 +8,7 @@ const DB_MIN: f32 = -50.0;
 const DB_MAX: f32 = -10.0;
 
 fn db_to_pct(db: f32) -> f32 {
+    if !db.is_finite() { return 0.0; }
     ((db - DB_MIN) / (DB_MAX - DB_MIN) * 100.0).clamp(0.0, 100.0)
 }
 

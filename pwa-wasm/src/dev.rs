@@ -204,7 +204,7 @@ pub fn DevScreen(
                     {move || {
                         let ht = hide_telem.get();
                         raw_ws_log.get().into_iter().rev()
-                            .filter(|e| !ht || !e.data.contains(r#""db":"#) || e.data.contains(r#""evt":"#))
+                            .filter(|e| !ht || !e.data.contains(r#""db":"#))
                             .map(|e| {
                                 let (dir_label, dir_color) = if e.direction == "rx" {
                                     ("RX", "#22c55e")

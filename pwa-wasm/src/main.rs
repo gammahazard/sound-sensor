@@ -332,7 +332,7 @@ fn App() -> impl IntoView {
                                     f(format!("TV: {} @ {}", brand.to_uppercase(), ip))
                                 });
                                 let mut cmd = format!(
-                                    r#"{{"cmd":"set_tv","ip":"{}","brand":"{}""#, json_escape(&ip), brand
+                                    r#"{{"cmd":"set_tv","ip":"{}","brand":"{}""#, json_escape(&ip), json_escape(&brand)
                                 );
                                 if !psk.is_empty() {
                                     cmd.push_str(&format!(r#","psk":"{}""#, json_escape(&psk)));
@@ -431,13 +431,15 @@ fn App() -> impl IntoView {
                                 set_ota_status.set(ws::OtaStatus::Downloading);
                                 send_sv.with_value(|f| f(r#"{"cmd":"ota_download"}"#.to_string()));
                                 add_event_sv.with_value(|f| f("OTA download started".to_string()));
-                                // 120s timeout to reset Downloading state if no response
+                                // 120s timeout — show error if still downloading
                                 let set_ota = set_ota_status.clone();
+                                let add_evt = add_event_sv.clone();
                                 wasm_bindgen_futures::spawn_local(async move {
                                     gloo_timers::future::TimeoutFuture::new(120_000).await;
                                     set_ota.update(|s| {
                                         if *s == ws::OtaStatus::Downloading {
-                                            *s = ws::OtaStatus::Idle;
+                                            *s = ws::OtaStatus::Error;
+                                            add_evt.with_value(|f| f("OTA download timed out".to_string()));
                                         }
                                     });
                                 });
@@ -513,4 +515,12 @@ pub fn main() {
     }
 
     mount_to_body(|| view! { <App /> });
+
+    // Remove loading spinner now that WASM has mounted
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("loading"))
+    {
+        el.remove();
+    }
 }

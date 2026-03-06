@@ -36,7 +36,7 @@ embassy-rp = {
 # Networking (lwIP wrapper)
 embassy-net = {
     version  = "0.6",
-    features = ["tcp", "udp", "dns", "dhcpv4", "medium-ethernet", "multicast"]
+    features = ["tcp", "udp", "dns", "dhcpv4", "dhcpv4-hostname", "medium-ethernet", "multicast"]
 }
 
 # CYW43 WiFi chip driver (on-chip WiFi for Pico W/Pico 2 W)

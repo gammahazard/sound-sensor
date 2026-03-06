@@ -174,5 +174,6 @@ fn compute_db(samples: &[f32]) -> f32 {
     if rms < 1.0 {
         return -96.0;
     }
-    20.0 * log10f(rms / FULL_SCALE_24)
+    let db = 20.0 * log10f(rms / FULL_SCALE_24);
+    db.clamp(-96.0, 0.0)
 }

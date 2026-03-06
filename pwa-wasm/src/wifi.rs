@@ -25,6 +25,7 @@ pub fn WifiScreen(
     let (result_msg, set_result)    = signal(String::new());
     let (result_ok,  set_result_ok) = signal(false);
     let (scanning, set_scanning)    = signal(false);
+    let (confirming, set_confirming) = signal(false);
 
     // Clear scanning when results arrive (avoids setting signal in reactive closure)
     Effect::new(move || {
@@ -177,25 +178,53 @@ pub fn WifiScreen(
                     </div>
                 })}
 
+                // Inline confirmation warning (replaces browser confirm())
+                {move || confirming.get().then(|| view! {
+                    <div style="background:#451a03;border-radius:10px;padding:12px;\
+                                display:flex;flex-direction:column;gap:8px">
+                        <div style="font-size:13px;color:#fbbf24;font-weight:500">
+                            "This will disconnect Guardian from the current network. Continue?"
+                        </div>
+                        <div style="display:flex;gap:8px">
+                            <button
+                                on:click=move |_| {
+                                    set_confirming.set(false);
+                                    let ssid = get_input_value("wifi-ssid");
+                                    let pass = get_input_value("wifi-pass");
+                                    set_result.set(
+                                        format!("Reconnecting to \"{}\"… Guardian may be unreachable briefly.", ssid)
+                                    );
+                                    set_result_ok.set(true);
+                                    on_reconfigure.with_value(|f| f(ssid, pass));
+                                }
+                                style="flex:1;padding:10px;border-radius:10px;border:none;\
+                                       background:#f59e0b;color:#0f172a;font-size:14px;\
+                                       font-weight:700;cursor:pointer"
+                            >
+                                "Confirm"
+                            </button>
+                            <button
+                                on:click=move |_| set_confirming.set(false)
+                                style="flex:1;padding:10px;border-radius:10px;\
+                                       border:1px solid #475569;background:transparent;\
+                                       color:#f1f5f9;font-size:14px;font-weight:600;\
+                                       cursor:pointer"
+                            >
+                                "Cancel"
+                            </button>
+                        </div>
+                    </div>
+                })}
+
                 <button
                     on:click=move |_| {
                         let ssid = get_input_value("wifi-ssid");
-                        let pass = get_input_value("wifi-pass");
                         if ssid.is_empty() {
                             set_result.set("Enter the network name (SSID)".to_string());
                             set_result_ok.set(false);
                             return;
                         }
-                        let window = web_sys::window().unwrap();
-                        let confirmed = window.confirm_with_message(
-                            "This will disconnect Guardian from the current network. Continue?"
-                        ).unwrap_or(false);
-                        if !confirmed { return; }
-                        set_result.set(
-                            format!("Reconnecting to \"{}\"… Guardian may be unreachable briefly.", ssid)
-                        );
-                        set_result_ok.set(true);
-                        on_reconfigure.with_value(|f| f(ssid, pass));
+                        set_confirming.set(true);
                     }
                     style="width:100%;padding:14px;border-radius:12px;border:none;\
                            background:#6366f1;color:white;font-size:16px;\
