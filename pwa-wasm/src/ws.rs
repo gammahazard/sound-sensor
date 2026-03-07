@@ -26,6 +26,8 @@ struct ServerMsg {
     #[serde(default)]
     ducking:  Option<bool>,
     #[serde(default)]
+    crying:   Option<bool>,
+    #[serde(default)]
     tv_status: Option<u8>,
     #[serde(default)]
     fw:       Option<String>,
@@ -194,6 +196,7 @@ pub struct WsSignals {
     pub set_pwa_ver:         WriteSignal<String>,
     pub set_msg_count:       WriteSignal<u32>,
     pub set_ducking:         WriteSignal<bool>,
+    pub set_crying:          WriteSignal<bool>,
     pub set_tv_status:       WriteSignal<u8>,
     pub set_wifi_networks:   WriteSignal<Vec<NetworkInfo>>,
     pub set_discovered_tvs:  WriteSignal<Vec<DiscoveredTv>>,
@@ -209,7 +212,7 @@ pub fn use_websocket(signals: WsSignals) -> impl Fn(String) + Clone + 'static {
     let WsSignals {
         set_db, set_armed, set_tripwire, set_ws_state,
         set_fw_ver, set_pwa_ver, set_msg_count,
-        set_ducking, set_tv_status, set_wifi_networks, set_discovered_tvs, set_ota_status,
+        set_ducking, set_crying, set_tv_status, set_wifi_networks, set_discovered_tvs, set_ota_status,
         set_dev_mode, set_dev_logs, set_raw_ws_log, set_reconnect_count, set_last_msg_time,
     } = signals;
     let (tx, mut rx) = futures::channel::mpsc::unbounded::<String>();
@@ -275,13 +278,14 @@ pub fn use_websocket(signals: WsSignals) -> impl Fn(String) + Clone + 'static {
                                             if let Some(evt) = &m.evt {
                                                 handle_event(evt, &m,
                                                     set_wifi_networks, set_discovered_tvs,
-                                                    set_ota_status, set_dev_logs);
+                                                    set_ota_status, set_dev_logs, set_crying);
                                                 continue;
                                             }
                                             if let Some(v) = m.db       { set_db.set(v); }
                                             if let Some(v) = m.armed    { set_armed.set(v); }
                                             if let Some(v) = m.tripwire { set_tripwire.set(v); }
                                             if let Some(v) = m.ducking    { set_ducking.set(v); }
+                                            if let Some(v) = m.crying    { set_crying.set(v); }
                                             if let Some(v) = m.tv_status { set_tv_status.set(v); }
                                             if let Some(v) = m.fw        { set_fw_ver.set(v); }
                                             if let Some(v) = m.pwa       { set_pwa_ver.set(v); }
@@ -329,8 +333,12 @@ fn handle_event(
     set_discovered_tvs: WriteSignal<Vec<DiscoveredTv>>,
     set_ota_status:     WriteSignal<OtaStatus>,
     set_dev_logs:       WriteSignal<Vec<DevLogEntry>>,
+    set_crying:         WriteSignal<bool>,
 ) {
     match evt {
+        "baby_cry" => {
+            set_crying.set(true);
+        }
         "wifi_scan" => {
             if let Some(nets) = &m.networks {
                 set_wifi_networks.set(nets.clone());

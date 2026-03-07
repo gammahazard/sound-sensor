@@ -1,6 +1,6 @@
 # Guardian Sound Sensor
 
-Privacy-first nursery sound monitor. Place a microphone at your baby's door — Guardian listens for sustained loud noise and automatically ducks your living room TV volume in seconds. When the noise stops, volume restores smoothly. Runs entirely on your home LAN with zero cloud, zero subscriptions, and zero audio recording.
+Privacy-first nursery sound monitor. Place a microphone at your baby's door — Guardian listens for sustained loud noise and automatically ducks your living room TV volume in seconds. When the noise stops, volume restores smoothly. It also detects baby crying using spectral analysis (Goertzel algorithm + harmonic tracking + temporal pattern recognition) and sends a real-time notification to your phone. Runs entirely on your home LAN with zero cloud, zero subscriptions, and zero audio recording.
 
 ---
 
@@ -8,6 +8,7 @@ Privacy-first nursery sound monitor. Place a microphone at your baby's door — 
 
 - [How It Works](#how-it-works)
 - [The Ducking Algorithm](#the-ducking-algorithm)
+- [Baby Cry Detection](#baby-cry-detection)
 - [Hardware](#hardware)
 - [Project Structure](#project-structure)
 - [Firmware Architecture](#firmware-architecture)
@@ -29,43 +30,46 @@ Privacy-first nursery sound monitor. Place a microphone at your baby's door — 
 ## How It Works
 
 ```
-                           ┌─────────────────────────────────────────────┐
-                           │           Raspberry Pi Pico 2 W             │
-SPH0645LM4H ──I²S──►      │                                             │
-   (mic at               │  audio_task ──► DuckingEngine ──► tv_task   │
-   baby's door)          │      │              │                │       │
-                           │      ▼              ▼                ▼       │
-                           │  DB_CHANNEL    LED_CHANNEL     LG/Samsung  │
-                           │      │              │          Sony/Roku    │
-                           │      ▼              ▼            (WiFi)    │
-                           │  websocket_task  wifi_task                  │
-                           │      │  (port 81)    │  (LED + flash)      │
-                           │      │              │                       │
-                           │  http_task (port 80) ◄─── PWA assets       │
-                           └──────┼───────────────┼─────────────────────┘
-                                  │               │
-                                  ▼               ▼
-                           Your phone         On-board LED
-                           (Leptos/WASM PWA)  (CYW43 GPIO_0)
+                           ┌──────────────────────────────────────────────────┐
+                           │              Raspberry Pi Pico 2 W               │
+SPH0645LM4H ──I²S──►      │                                                  │
+   (mic at               │  audio_task ──┬── DB_CHANNEL ──► ducking_task    │
+   baby's door)          │   (Goertzel   │                    │    │         │
+                           │    + Hanning  └── CRY_CHANNEL ──►│    │         │
+                           │    + ZCR)           │             │    ▼         │
+                           │                     │         tv_task  LED      │
+                           │                     │         (LG/Samsung       │
+                           │                     │          Sony/Roku)       │
+                           │                     ▼                           │
+                           │  websocket_task ◄── TELEMETRY + CRY_EVENT_CH   │
+                           │      │  (port 81)                               │
+                           │  http_task (port 80) ◄─── PWA assets            │
+                           └──────┼──────────────────────────────────────────┘
+                                  │
+                                  ▼
+                           Your phone
+                           (Leptos/WASM PWA)
 ```
 
-The Pico 2 W runs six concurrent Embassy tasks in normal (station) mode, or eight in AP setup mode:
+The Pico 2 W runs seven concurrent Embassy tasks in normal (station) mode, or nine in AP setup mode:
 
-1. **audio_task** — Captures 24-bit I²S audio from the SPH0645 microphone at 16 kHz using a PIO state machine. Applies an IIR DC blocker per-sample, then every 100ms (1,600 samples) computes the RMS power level in dBFS with EMA smoothing and pushes it into `DB_CHANNEL`.
+1. **audio_task** — Captures 24-bit I²S audio from the SPH0645 microphone at 16 kHz using a PIO state machine. Applies a 2nd-order Butterworth high-pass filter (200 Hz cutoff) per-sample. Every 100ms (1,600 samples) computes RMS dBFS with EMA smoothing and pushes to `DB_CHANNEL`. Also runs 10 Goertzel bins (5 F0 + 5 harmonic) with Hanning windowing, zero-crossing rate counting, and energy accumulation for baby cry spectral detection, pushing results to `CRY_CHANNEL`.
 
-2. **websocket_task** — Receives dB readings from `DB_CHANNEL`, ticks the ducking state machine, broadcasts telemetry JSON to the connected PWA at 10 Hz, and processes incoming commands (arm, disarm, calibrate, set TV, etc.).
+2. **ducking_task** — Receives dB readings from `DB_CHANNEL` and cry detection results from `CRY_CHANNEL`. Ticks the ducking state machine and the `CryTracker` temporal pattern detector. Updates the shared `TELEMETRY` snapshot for the WebSocket task.
 
-3. **tv_task** — Receives duck/restore commands from the ducking engine and executes them against the configured TV using the appropriate protocol (WebSocket for LG/Samsung, HTTP for Sony/Roku).
+3. **websocket_task** — Reads telemetry from the shared snapshot, broadcasts JSON to the connected PWA at 10 Hz, sends one-shot `baby_cry` events via `CRY_EVENT_CH`, and processes incoming commands (arm, disarm, calibrate, set TV, etc.).
 
-4. **wifi_task** — Initializes the CYW43439 WiFi chip, joins the network, runs the DHCP stack, handles WiFi scan requests, saves credentials to flash, and drives the onboard LED pattern in a 100ms loop.
+4. **tv_task** — Receives duck/restore commands from the ducking engine and executes them against the configured TV using the appropriate protocol (WebSocket for LG/Samsung, HTTP for Sony/Roku).
 
-5. **http_task** — Serves the PWA (HTML + WASM + JS) on port 80. The entire web UI is compiled into the firmware binary via `include_bytes!`, so there are no external file dependencies at runtime. In AP mode, serves the setup page instead.
+5. **wifi_task** — Initializes the CYW43439 WiFi chip, joins the network, runs the DHCP stack, handles WiFi scan requests, saves credentials to flash, and drives the onboard LED pattern in a 100ms loop.
+
+6. **http_task** — Serves the PWA (HTML + WASM + JS) on port 80. The entire web UI is compiled into the firmware binary via `include_bytes!`, so there are no external file dependencies at runtime. In AP mode, serves the setup page instead.
 
 In AP setup mode, three additional tasks run:
 
-6. **dhcp_server_task** — Minimal DHCP server assigning `192.168.4.2` to connecting phones with a 5-minute lease.
-7. **dns_server_task** — Resolves all DNS A queries to `192.168.4.1`, triggering captive portal detection on phones so the setup page auto-opens.
-8. **mdns_responder_task** — Announces `guardian.local` (station) or `guardiansetup.local` (AP) via multicast DNS on port 5353. Sends startup announcements and responds to A/ANY queries.
+7. **dhcp_server_task** — Minimal DHCP server assigning `192.168.4.2` to connecting phones with a 5-minute lease.
+8. **dns_server_task** — Resolves all DNS A queries to `192.168.4.1`, triggering captive portal detection on phones so the setup page auto-opens.
+9. **mdns_responder_task** — Announces `guardian.local` (station) or `guardiansetup.local` (AP) via multicast DNS on port 5353. Sends startup announcements and responds to A/ANY queries.
 
 Your phone connects to the Pico's IP address (or `http://guardian.local` if mDNS is working), loads the WASM PWA, and communicates over a WebSocket on port 81. Everything stays on your local network — the Pico never contacts any external server unless you explicitly press the OTA check button.
 
@@ -153,6 +157,61 @@ If a restore fails (TV unreachable, connection dropped), Guardian clears the duc
 
 ---
 
+## Baby Cry Detection
+
+Guardian includes a dedicated baby cry detection system that runs independently of the ducking engine. It identifies crying using spectral analysis and temporal pattern recognition, and sends a real-time notification to the app. This is notification-only — it does not affect TV volume.
+
+### Why Not Just Use the dB Level?
+
+A simple volume threshold would trigger on any loud sound — TV action scenes, music, door slams, coughing. Baby cries have distinctive spectral and temporal characteristics that allow reliable discrimination:
+
+- **Fundamental frequency (F0)**: 350–550 Hz (adult male speech is 85–180 Hz, female 165–255 Hz)
+- **Harmonics**: Strong energy at exact multiples (2× F0: 700–1100 Hz)
+- **Temporal pattern**: Rhythmic ~1 Hz burst cycle (0.5–1.6s of crying, 0.3–0.5s breath pause, repeating)
+
+### Spectral Detection (per 100ms window)
+
+The audio pipeline runs 10 Goertzel bins inline with the existing sample loop — no FFT needed:
+
+| Bins | Frequencies | Purpose |
+|---|---|---|
+| 5 F0 bins | 350, 400, 450, 500, 550 Hz | Baby cry fundamental range |
+| 5 harmonic bins | 700, 800, 900, 1000, 1100 Hz | 2nd harmonic at 2× each F0 |
+
+A **Hanning window** (via recursive cosine oscillator) reduces spectral leakage from -13 dB to -31 dB sidelobes, preventing nearby frequencies from bleeding into cry bins.
+
+Each 100ms window runs a 6-check pipeline:
+
+1. **Volume gate**: dB ≥ tripwire (loud enough to matter)
+2. **F0 energy**: strongest cry bin > noise floor (meaningful tonal energy)
+3. **Adaptive harmonic**: harmonic at 2× the strongest F0 is ≥ 5% of fundamental (confirms tonal source, not broadband noise)
+4. **Zero-crossing rate**: 50–130 crossings per window (consistent with 350–550 Hz; rejects low-frequency rumble and high-frequency hiss)
+5. **Tonal energy ratio**: F0 + harmonic energy ≥ 0.5% of total energy (cry concentrates energy; broadband noise spreads it)
+6. **Spectral peakedness**: best F0 bin is ≥ 1.8× the average of all F0 bins (one dominant frequency, not flat spectrum)
+
+### Temporal Pattern (CryTracker)
+
+A single cry-positive window is not enough — a TV scene with a 450 Hz tone would trigger it. The `CryTracker` requires a sustained rhythmic burst-gap pattern:
+
+- **Cry burst**: 3–16 consecutive cry-positive windows (300ms–1.6s)
+- **Breath gap**: 2–5 cry-negative windows (200ms–500ms)
+- **Confirmed crying**: 3+ completed burst-gap cycles → notification sent
+- **Cooldown**: crying flag stays active for 3 seconds after the pattern stops
+
+This means the fastest possible detection is ~3 seconds (3 short burst-gap cycles). A single 1-second TV cry scene will not trigger.
+
+### Always Active
+
+Cry detection runs regardless of whether Guardian is armed or disarmed. The ducking system (TV volume control) only works when armed, but cry notification always works — parents always get alerted.
+
+### Resource Cost
+
+- **CPU**: ~3% (10 Goertzel multiply-accumulates + Hanning + ZCR per sample at 16 kHz)
+- **RAM**: ~130 bytes (10 bins × 12 bytes + 10 bytes CryTracker state)
+- **Flash**: ~600 bytes code
+
+---
+
 ## Hardware
 
 ### Development Unit
@@ -208,8 +267,8 @@ sound-sensor/
 │   │   └── 43439A0_clm.bin
 │   └── src/
 │       ├── main.rs           Entry point, AP_MODE flag, task spawning, channels, dev_log! macro
-│       ├── audio.rs          PIO I²S capture + IIR DC blocker + RMS → dBFS + EMA smoothing
-│       ├── ducking.rs        Ducking state machine (Quiet/Watching/Ducking/Restoring)
+│       ├── audio.rs          PIO I²S capture + HPF + Goertzel cry detection + RMS → dBFS
+│       ├── ducking.rs        Ducking state machine + CryTracker temporal pattern detector
 │       ├── net.rs            WiFi: AP mode fork or station join, flash creds, LED loop, mDNS
 │       ├── ws.rs             WebSocket server (port 81), SHA-1, Base64, frame codec
 │       ├── tv.rs             LG/Samsung/Sony/Roku TV control + SSDP discovery
@@ -233,7 +292,7 @@ sound-sensor/
 │       ├── main.rs           App root, 6 tabs (Dev tab conditional), setup wizard
 │       ├── setup.rs          First-time setup wizard (Welcome → Cal → TV → Done)
 │       ├── ws.rs             WebSocket client, auto-reconnect, event dispatch
-│       ├── meter.rs          Live dB bar (-50 to -10 dBFS), peak hold, ducking banner
+│       ├── meter.rs          Live dB bar, peak hold, ducking banner, cry alert banner
 │       ├── calibration.rs    Two-step calibration + manual threshold slider
 │       ├── tv.rs             Brand buttons, SSDP discover list, IP input, connect
 │       ├── wifi.rs           WiFi scan, signal bars, network list, credential form
@@ -247,18 +306,19 @@ sound-sensor/
 │   │   ├── ducking.rs        DuckingEngine (Instant replaced with injectable u64)
 │   │   ├── parsers.rs        parse_f32_field, parse_str_field, parse_ip, etc.
 │   │   ├── crypto.rs         CRC32, SHA-1, Base64, ws_accept_header
-│   │   ├── audio.rs          compute_db (RMS → dBFS)
+│   │   ├── audio.rs          compute_db, GoertzelBin, is_cry_like, CryTracker, ZCR
 │   │   ├── ota.rs            is_newer, parse_tag_name, status_json
 │   │   ├── flash_layout.rs   Config block serialize/deserialize on [u8; 256]
 │   │   ├── ws_frame.rs       WebSocket frame encode/decode
 │   │   └── tv_brand.rs       TvBrand enum with parse/to_u8/from_u8
 │   └── tests/
-│       ├── test_ducking.rs    31 tests — state machine, rates, restore paths
-│       ├── test_parsers.rs    38 tests — JSON/string/IP/SSDP parsers
+│       ├── test_ducking.rs    35 tests — state machine, rates, restore paths
+│       ├── test_parsers.rs    44 tests — JSON/string/IP/SSDP parsers
 │       ├── test_crypto.rs     14 tests — SHA-1, Base64, CRC32, WS accept
-│       ├── test_flash_layout.rs 14 tests — roundtrip, interleave, corruption
+│       ├── test_flash_layout.rs 18 tests — roundtrip, interleave, corruption
 │       ├── test_ws_frame.rs   11 tests — encode, decode, roundtrip, unmask
-│       ├── test_audio.rs      7 tests — silence, full-scale, known RMS
+│       ├── test_audio.rs      38 tests — dB, Goertzel, Hanning, ZCR, cry detection, integration
+│       ├── test_tv_brand.rs   11 tests — brand parse, port, u8 roundtrip
 │       └── test_ota.rs        15 tests — version comparison, tag parse, status JSON
 │
 ├── phase0_micropython/       Hardware verification (MicroPython)
@@ -280,11 +340,14 @@ Tasks communicate through typed, fixed-capacity Embassy channels:
 
 | Channel | Type | Capacity | From → To |
 |---|---|---|---|
-| `DB_CHANNEL` | `f32` | 4 | audio_task → websocket_task |
+| `DB_CHANNEL` | `f32` | 4 | audio_task → ducking_task |
+| `CRY_CHANNEL` | `bool` | 4 | audio_task → ducking_task |
+| `CRY_EVENT_CH` | `()` | 1 | ducking_task → ws_task (one-shot) |
 | `LED_CHANNEL` | `LedPattern` | 4 | any task → wifi_task |
 | `WIFI_CMD_CH` | `WifiCmd` | 4 | ws_task / tv_task → wifi_task |
 | `WIFI_EVT_CH` | `WifiEvent` | 2 | wifi_task → ws_task |
 | `DUCK_CHANNEL` | `DuckCommand` | 8 | ducking_task → tv_task |
+| `TELEM_SIGNAL` | `()` | 1 | ducking_task → ws_task |
 
 ### Audio Pipeline
 
@@ -292,14 +355,20 @@ The audio pipeline uses the RP2350's PIO (Programmable I/O) to implement an I²S
 
 1. PIO program (8 instructions) generates BCLK + WS clocks via side-set and reads DOUT
 2. Each 32-bit word is right-shifted 8 bits to extract the signed 24-bit sample
-3. An **IIR DC blocker** (R=0.9992, ~2 Hz cutoff) removes the MEMS mic DC bias per-sample — without this, the DC offset swamps the AC signal and reduces dynamic range to ~6 dB
-4. Every 1,600 samples (100ms at 16 kHz), RMS is computed on the DC-blocked samples:
+3. A **2nd-order Butterworth high-pass filter** (200 Hz cutoff) removes the MEMS mic DC bias and low-frequency rumble per-sample
+4. **Hanning window** (recursive cosine oscillator) applied to the filtered sample for Goertzel input
+5. **10 Goertzel bins** fed with windowed samples (5 F0 bins at 350–550 Hz + 5 harmonic bins at 700–1100 Hz)
+6. **Zero-crossing rate** counted on the unwindowed filtered signal
+7. **Total energy** accumulated (sum of filtered²) for harmonic-to-total ratio
+8. Every 1,600 samples (100ms at 16 kHz), RMS is computed:
    ```
    rms = sqrt(sum(filtered²) / count)
    dBFS = 20 * log10(rms / 8388608)    // 2^23 full-scale
    ```
-5. An **exponential moving average** (alpha=0.15, ~600ms settling) smooths the dB output to reduce noise-floor jitter
-6. If RMS < 1.0 (effectively silence), returns -96.0 dBFS
+9. An **exponential moving average** (attack=0.3, decay=0.08) smooths the dB output
+10. **6-check cry detection pipeline** evaluates the Goertzel powers, ZCR, and energy
+11. dB pushed to `DB_CHANNEL`, cry result pushed to `CRY_CHANNEL`
+12. If RMS < 1.0 (effectively silence), returns -96.0 dBFS
 
 ### WebSocket Server
 
@@ -361,7 +430,7 @@ The wizard step is tracked in the parent component, so when the user navigates t
 
 ### Six Tabs
 
-**Meter** — The main screen. Shows a real-time dB level bar (updated 10x/sec) with color coding: green (quiet), yellow (moderate), red (loud). A white vertical marker shows the tripwire position. Peak hold displays the highest dB in the last 2 seconds. When ducking is active, an amber banner reads "Volume Ducked". The Arm/Disarm button controls whether Guardian is actively listening. A recent events list shows the last 5 events (ducking started, volume restored, calibration changes, etc.).
+**Meter** — The main screen. Shows a real-time dB level bar (updated 10x/sec) with color coding: green (quiet), yellow (moderate), red (loud). A white vertical marker shows the tripwire position. Peak hold displays the highest dB in the last 2 seconds. When ducking is active, an amber banner reads "Volume Ducked". When baby crying is confirmed, a red pulsing banner reads "Baby Crying Detected" with "Rhythmic cry pattern confirmed." subtitle — it auto-dismisses when crying stops. The Arm/Disarm button controls whether Guardian is actively listening. A recent events list shows the last 5 events (ducking started, volume restored, baby crying detected/stopped, calibration changes, etc.).
 
 **Calibrate** — Two-step calibration wizard. Step 1: make the room quiet, tap "Record Quiet Level" — this sets the noise floor. Step 2: turn your TV to the loudest volume you'd ever use, tap "Record TV Volume" — this sets the tripwire 3 dB below that level. A manual slider allows fine-tuning the tripwire after calibration. Validation ensures the tripwire is at least 6 dB above the floor.
 
@@ -442,7 +511,8 @@ Bytes 166–173: Sony PSK (null-terminated, max 8 chars)
 Byte 174:      Calibration valid flag (0=no, 1=yes)
 Bytes 175–178: Floor dB (f32, little-endian)
 Bytes 179–182: Tripwire dB (f32, little-endian)
-Bytes 183–251: Reserved (69 bytes, zero-filled)
+Bytes 183–188: TV MAC address (6 bytes, for Wake-on-LAN power on)
+Bytes 189–251: Reserved (63 bytes, zero-filled)
 Bytes 252–255: CRC32 over bytes 0–251 (little-endian)
 ```
 
@@ -457,20 +527,23 @@ Bytes 252–255: CRC32 over bytes 0–251 (little-endian)
 ### Telemetry (server → client, 10x/sec)
 
 ```json
-{"db":-32.5,"armed":false,"tripwire":-20.0,"ducking":false,"fw":"0.3.0","pwa":"0.1.0"}
+{"db":-32.5,"armed":false,"tripwire":-20.0,"ducking":false,"crying":false,"fw":"0.3.0","pwa":"0.1.0"}
 ```
 
-All 6 fields are always present. `ducking` is true when the state machine is in the Ducking state.
+All 7 fields are always present. `ducking` is true when the state machine is in the Ducking state. `crying` is true when the CryTracker has confirmed a rhythmic cry pattern (3+ burst-gap cycles).
 
 ### Events (server → client, on demand)
 
 ```json
+{"evt":"baby_cry"}
 {"evt":"wifi_scan","networks":[{"ssid":"Home","rssi":-45},{"ssid":"Guest","rssi":-72}]}
 {"evt":"discovered","tvs":[{"ip":"192.168.1.100","name":"LG WebOS TV","brand":"lg"}]}
 {"evt":"ota_status","checking":false,"available":true,"current":"0.1.0","latest":"0.2.0","fw":"0.3.0"}
 {"evt":"ota_done","pwa":"0.2.0","fw":"0.3.0"}
 {"evt":"wifi_reconfiguring","ssid":"NewNetwork"}
 ```
+
+The `baby_cry` event is a one-shot rising-edge notification sent when crying is first confirmed. The continuous `crying` state is tracked in telemetry.
 
 ### Commands (client → server)
 
@@ -602,16 +675,16 @@ PWA tests are `#[cfg(test)]` inline modules that compile natively (not to WASM).
 ### Running Tests
 
 ```bash
-# Firmware logic tests (130+ tests, runs on host)
+# Firmware logic tests (186 tests, runs on host)
 cd guardian-test && cargo test
 
-# PWA logic tests (31 tests, runs on host)
+# PWA logic tests (40 tests, runs on host)
 cd pwa-wasm && cargo test --lib --target x86_64-unknown-linux-gnu
 ```
 
-### Test Coverage: guardian-test (130+ tests)
+### Test Coverage: guardian-test (186 tests)
 
-#### Ducking State Machine — 31 tests (`test_ducking.rs`)
+#### Ducking State Machine — 35 tests (`test_ducking.rs`)
 
 | Test | What It Verifies |
 |---|---|
@@ -636,7 +709,7 @@ cd pwa-wasm && cargo test --lib --target x86_64-unknown-linux-gnu
 | `watching_to_quiet_transition` | sustained_ms decays to 0 in Watching → transitions to Quiet |
 | `ducking_stays_ducking_during_hold` | sustained_ms=0 in Ducking → stays Ducking (not Quiet) |
 
-#### JSON/String Parsers — 38 tests (`test_parsers.rs`)
+#### JSON/String Parsers — 44 tests (`test_parsers.rs`)
 
 Tests all parser functions extracted from the firmware: `parse_f32_field` (positive, negative, missing, no digits, trailing chars, integer), `parse_str_field` (basic, empty, missing quote, embedded quote, second field), `parse_ip` (valid, invalid octet, too few parts, zeros, max, letters), `parse_volume_from_json` (basic, missing, zero, 100), `extract_ssdp_field` (case-insensitive, missing, different fields), `parse_json_str` (basic, missing).
 
@@ -655,7 +728,7 @@ Tests all parser functions extracted from the firmware: `parse_f32_field` (posit
 | `crc32_single_bit_flip` | Flipping one bit changes CRC |
 | `crc32_deterministic` | Same input always produces same CRC |
 
-#### Flash Layout — 14 tests (`test_flash_layout.rs`)
+#### Flash Layout — 18 tests (`test_flash_layout.rs`)
 
 Tests serialize/deserialize of the 256-byte config block: WiFi roundtrip, TV config roundtrip, interleaved saves (both orders), bad magic/CRC rejection, max-length SSID (63 chars), SSID truncation at 64 chars, Sony PSK max 8 chars, PSK truncation at 9 chars, empty IP disables TV, all 4 brands roundtrip, null byte in SSID truncates, empty SSID returns None.
 
@@ -663,22 +736,35 @@ Tests serialize/deserialize of the 256-byte config block: WiFi roundtrip, TV con
 
 Tests frame encoding for short payloads (< 126 bytes, 2-byte header), extended payloads (>= 126 bytes, 4-byte header), boundary cases (exactly 125 and 126 bytes), encode→decode roundtrips, too-short frame rejection, payload unmasking, and equivalence of `ws_text_frame` and `ws_frame_masked`.
 
-#### Audio dB Computation — 7 tests (`test_audio.rs`)
+#### Audio + Cry Detection — 38 tests (`test_audio.rs`)
 
-Tests silence (all-zero → -96.0 dBFS), full-scale (max 24-bit → ~0 dBFS), known RMS value (~1/10 scale → ~-20 dBFS), negative samples (same RMS as positive), single sample edge case, and very quiet signals.
+| Category | Count | What They Cover |
+|---|---|---|
+| compute_db | 9 | Silence, full-scale, known RMS, negative samples, single sample, empty, very quiet, sub-1 RMS, clamp above 0 |
+| Goertzel | 4 | Detects 450 Hz, rejects wrong frequency, detects harmonic, reset clears state |
+| Hanning window | 3 | Endpoints near zero, center is 1.0, reduces spectral leakage 10× |
+| Multi-bin coverage | 2 | Catches 500 Hz cry (older baby), catches 350 Hz cry (newborn) |
+| Zero-crossing rate | 3 | 450 Hz → ~90 crossings, 200 Hz → ~40, silence → 0 |
+| is_cry_like v2 | 10 | True at 350/450/500 Hz, false for below tripwire, no harmonic, ZCR too low/high, flat spectrum, silence, low tonal ratio |
+| CryTracker | 5 | 3 cycles confirms, 2 not enough, single burst rejected, cooldown clears, brief bursts rejected |
+| Integration | 2 | Full pipeline (synthetic 450+900 Hz → 10 Goertzel bins → is_cry_like = true), broadband noise rejected |
+
+#### TV Brand — 11 tests (`test_tv_brand.rs`)
+
+Tests brand parsing (LG aliases, Samsung, Sony aliases, Roku, unknown), u8 roundtrip for all brands, default ports, absolute volume support flags.
 
 #### OTA Version Comparison — 15 tests (`test_ota.rs`)
 
 Tests `is_newer` (basic, with "v" prefix, equal, patch, major, older, both with "v", major-only), `parse_tag_name` (basic, missing, with spaces, empty), and `status_json` (checking state, available update, done event).
 
-### Test Coverage: PWA Inline Tests (31 tests)
+### Test Coverage: PWA Inline Tests (40 tests)
 
 | Module | Tests | What They Cover |
 |---|---|---|
 | `meter.rs` | 10 | `db_to_pct` (min, max, mid, clamp below, clamp above), `bar_color` (green, yellow, red, boundaries) |
-| `main.rs` | 5 | `json_escape` (clean string, quotes, backslashes, both, empty) |
+| `main.rs` | 8 | `json_escape` (clean string, quotes, backslashes, both, empty, newline, tab/cr, control char) |
 | `ws.rs` | 7 | `rssi_bars` (excellent, good, fair, weak, boundary values at -50, -60, -70) |
-| `tv.rs` | 9 | `is_valid_ip` (valid, zeros, max, too few parts, too many, overflow, letters, empty, negative) |
+| `tv.rs` | 15 | `is_valid_ip` (valid, zeros, max, too few/many parts, overflow, letters, empty, negative), `ip_prefix` (valid, empty, hostname, invalid, zeros) |
 
 ### Bug Found by Tests
 
@@ -792,7 +878,8 @@ curl -X POST http://192.168.1.X:8060/keypress/VolumeUp
 ### What Works
 - **Onboarding**: AP mode WiFi provisioning (Guardian-Setup hotspot → captive portal → credential entry → reboot)
 - **PWA**: Loads and renders correctly on desktop and mobile via direct IP access
-- **Sound detection**: I²S mic captures audio with IIR DC blocker for proper dynamic range
+- **Sound detection**: I²S mic captures audio with 2nd-order Butterworth HPF for proper dynamic range
+- **Baby cry detection**: 10-bin Goertzel + Hanning window + ZCR + temporal pattern recognition, always active
 - **Calibration**: Two-step calibration (silence + max) persists to flash
 - **Dev mode**: `--features dev-mode` enables Dev tab with log stream, state dashboard, WS inspector
 - **Gzip compression**: JS + WASM served compressed (~210 KB vs ~580 KB raw)

@@ -653,10 +653,10 @@ pub async fn tv_task(
 
                 if !ok {
                     dev_log!(crate::dev_log::LogCat::Tv, crate::dev_log::LogLevel::Warn,
-                        "http cmd fail, will retry next cmd");
-                    warn!("[tv] HTTP command failed — will retry on next command");
-                    // Don't break — just let the next command try a fresh connection.
-                    // Only break if config changed (checked at top of loop).
+                        "http cmd fail, backoff 2s");
+                    warn!("[tv] HTTP command failed — backoff 2s");
+                    // Back off before next attempt to avoid hammering a rate-limited TV
+                    Timer::after(Duration::from_secs(2)).await;
                 }
                 // cmd_socket dropped here — connection cleanly closed
             }
@@ -1034,7 +1034,7 @@ async fn sony_http_post<'b>(
          Content-Type: application/json\r\n\
          X-Auth-PSK: {}\r\n\
          Content-Length: {}\r\n\
-         Connection: keep-alive\r\n\
+         Connection: close\r\n\
          \r\n",
         path, ip, psk, body.len()
     );

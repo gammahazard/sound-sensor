@@ -146,6 +146,7 @@ fn App() -> impl IntoView {
     let (armed, set_armed)         = signal(false);
     let (tripwire, set_tripwire)   = signal(-20.0f32);
     let (ducking, set_ducking)     = signal(false);
+    let (crying, set_crying)       = signal(false);
     let (ws_state, set_ws_state)   = signal(ws::WsState::Connecting);
     let (active_tab, set_tab)      = signal("meter");
     let (fw_ver, set_fw_ver)       = signal(String::new());
@@ -205,11 +206,24 @@ fn App() -> impl IntoView {
         *prev_ducking.write_value() = d;
     });
 
+    // ── Crying state change → auto-generate events ────────────────────────
+    let prev_crying = StoredValue::new(false);
+    Effect::new(move || {
+        let c = crying.get();
+        let prev = prev_crying.get_value();
+        if c && !prev {
+            add_event_sv.with_value(|f| f("Baby crying detected".to_string()));
+        } else if !c && prev {
+            add_event_sv.with_value(|f| f("Crying stopped".to_string()));
+        }
+        *prev_crying.write_value() = c;
+    });
+
     // ── WebSocket ───────────────────────────────────────────────────────────
     let send = ws::use_websocket(ws::WsSignals {
         set_db, set_armed, set_tripwire, set_ws_state,
         set_fw_ver, set_pwa_ver, set_msg_count,
-        set_ducking, set_tv_status, set_wifi_networks, set_discovered_tvs, set_ota_status,
+        set_ducking, set_crying, set_tv_status, set_wifi_networks, set_discovered_tvs, set_ota_status,
         set_dev_mode, set_dev_logs, set_raw_ws_log, set_reconnect_count, set_last_msg_time,
     });
     let send_sv = StoredValue::new_local(send);
@@ -262,6 +276,7 @@ fn App() -> impl IntoView {
                             armed=armed
                             tripwire=tripwire
                             ducking=ducking
+                            crying=crying
                             events=events
                             on_arm_toggle=move || {
                                 haptic();

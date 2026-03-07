@@ -220,10 +220,10 @@ pub async fn wifi_task(
                         joined = true;
                         break;
                     }
-                    Err(_e) => {
+                    Err(e) => {
                         dev_log!(crate::dev_log::LogCat::Wifi, crate::dev_log::LogLevel::Warn,
-                            "join_fail attempt={}/5", attempt + 1);
-                        warn!("[net] Join failed");
+                            "join_fail attempt={}/5 status={}", attempt + 1, e.status);
+                        warn!("[net] Join failed: status={}", e.status);
                         control.gpio_set(0, false).await;
                         Timer::after(Duration::from_secs(3)).await;
                     }
@@ -249,10 +249,10 @@ pub async fn wifi_task(
                         joined = true;
                         break;
                     }
-                    Err(_e) => {
+                    Err(e) => {
                         dev_log!(crate::dev_log::LogCat::Wifi, crate::dev_log::LogLevel::Warn,
-                            "join_fail attempt={}/5", attempt + 1);
-                        warn!("[net] Join failed");
+                            "join_fail attempt={}/5 status={}", attempt + 1, e.status);
+                        warn!("[net] Join failed: status={}", e.status);
                         control.gpio_set(0, false).await;
                         Timer::after(Duration::from_secs(3)).await;
                     }
@@ -282,9 +282,7 @@ pub async fn wifi_task(
         // Turn LED off briefly to signal "join succeeded, waiting for IP"
         control.gpio_set(0, false).await;
 
-        let mut dhcp_cfg = embassy_net::DhcpConfig::default();
-        dhcp_cfg.hostname = Some(heapless::String::try_from("guardian").unwrap());
-        let cfg = NetConfig::dhcpv4(dhcp_cfg);
+        let cfg = NetConfig::dhcpv4(Default::default());
         let seed = tls_seed;
 
         let resources = RESOURCES.init(StackResources::new());
@@ -426,15 +424,8 @@ async fn handle_wifi_cmd(
             info!("[net] Reconfiguring WiFi → {}", ssid.as_str());
             let saved = flash_save_creds(fs.flash_mut(), ssid.as_str(), pass.as_str());
             if saved {
-                // Verify read-back before rebooting
-                if flash_load_creds(fs.flash_mut()).is_some() {
-                    Timer::after(Duration::from_millis(500)).await;
-                    cortex_m::peripheral::SCB::sys_reset();
-                } else {
-                    warn!("[net] Cred save verification failed!");
-                    let _ = LED_CHANNEL.try_send(LedPattern::Error);
-                    // Stay in current mode so user can retry
-                }
+                Timer::after(Duration::from_millis(500)).await;
+                cortex_m::peripheral::SCB::sys_reset();
             } else {
                 warn!("[net] Cred flash write failed!");
                 let _ = LED_CHANNEL.try_send(LedPattern::Error);

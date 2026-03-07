@@ -131,9 +131,9 @@ async fn handle_client(
 
             Either::First(_) => {
                 // Read latest telemetry snapshot (written by ducking_task)
-                let (db, armed, tripwire, ducking) = {
+                let (db, armed, tripwire, ducking, crying) = {
                     let t = TELEMETRY.lock().await;
-                    (t.db, t.armed, t.tripwire, t.ducking)
+                    (t.db, t.armed, t.tripwire, t.ducking, t.crying)
                 };
 
                 // Check for WiFi events to forward
@@ -165,13 +165,20 @@ async fn handle_client(
                     }
                 }
 
+                // Send one-shot baby_cry event if queued
+                if crate::CRY_EVENT_CH.try_receive().is_ok() {
+                    let evt_json: &[u8] = br#"{"evt":"baby_cry"}"#;
+                    let n = ws_text_frame(evt_json, &mut out_frame);
+                    if socket.write_all(&out_frame[..n]).await.is_err() { break; }
+                }
+
                 // Broadcast telemetry
                 let tv_status = crate::TV_STATUS.load(portable_atomic::Ordering::Relaxed);
-                let mut json: heapless::String<224> = heapless::String::new();
+                let mut json: heapless::String<256> = heapless::String::new();
                 let _ = core::write!(
                     json,
-                    r#"{{"db":{:.2},"armed":{},"tripwire":{:.2},"ducking":{},"tv_status":{},"fw":"{}","pwa":"{}""#,
-                    db, armed, tripwire, ducking, tv_status,
+                    r#"{{"db":{:.2},"armed":{},"tripwire":{:.2},"ducking":{},"crying":{},"tv_status":{},"fw":"{}","pwa":"{}""#,
+                    db, armed, tripwire, ducking, crying, tv_status,
                     crate::FW_VERSION,
                     crate::PWA_VERSION,
                 );

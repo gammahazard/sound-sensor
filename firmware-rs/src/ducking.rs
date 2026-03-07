@@ -59,6 +59,70 @@ const RESTORE_HOLD_SECS: u64 = 30;
 /// so phantom steps at volume 0 would cause too many VolumeUp presses).
 const MAX_DUCK_STEPS: u8 = 30;
 
+/// Baby cry temporal pattern tracker.
+/// Tracks rhythmic burst-gap cycles (~1 Hz) characteristic of infant crying.
+/// Runs independently of arm/disarm state — always active.
+pub struct CryTracker {
+    burst_windows: u8,
+    gap_windows: u8,
+    cycles: u8,
+    pub crying: bool,
+    cooldown_windows: u8,
+}
+
+impl CryTracker {
+    pub const fn new() -> Self {
+        Self { burst_windows: 0, gap_windows: 0, cycles: 0, crying: false, cooldown_windows: 0 }
+    }
+
+    /// Call every 100ms. Returns true only on the rising edge (first detection).
+    pub fn tick(&mut self, is_cry: bool) -> bool {
+        let was_crying = self.crying;
+
+        if is_cry {
+            self.burst_windows = self.burst_windows.saturating_add(1);
+            if self.gap_windows >= 2 && self.gap_windows <= 5 && self.cycles < 10 {
+                self.cycles += 1;
+            }
+            self.gap_windows = 0;
+        } else {
+            if self.burst_windows >= 3 && self.burst_windows <= 16 {
+                self.gap_windows = self.gap_windows.saturating_add(1);
+            } else if self.burst_windows > 0 {
+                self.cycles = 0;
+                self.gap_windows = 0;
+            } else {
+                self.gap_windows = self.gap_windows.saturating_add(1);
+            }
+            self.burst_windows = 0;
+            if self.gap_windows > 5 {
+                self.cycles = 0;
+                self.gap_windows = 0;
+            }
+        }
+
+        if self.cycles >= 3 {
+            self.crying = true;
+            self.cooldown_windows = 30;
+        }
+
+        if self.crying && !is_cry {
+            if self.cooldown_windows > 0 {
+                self.cooldown_windows -= 1;
+            } else {
+                self.crying = false;
+                self.cycles = 0;
+            }
+        }
+
+        if self.crying && self.cycles >= 3 {
+            self.cooldown_windows = 30;
+        }
+
+        self.crying && !was_crying
+    }
+}
+
 pub struct DuckingEngine {
     pub tripwire_db:  f32,
     pub floor_db:     f32,
@@ -75,6 +139,9 @@ pub struct DuckingEngine {
     /// TV volume captured just before the first VolumeDown command.
     /// Used on Restore to call setVolume instead of replaying VolumeUp presses.
     pub original_volume: Option<u8>,
+
+    /// Baby cry temporal pattern tracker (always active, independent of armed).
+    pub cry_tracker: CryTracker,
 }
 
 impl DuckingEngine {
@@ -89,6 +156,7 @@ impl DuckingEngine {
             duck_interval_ms: 1000,
             duck_steps_taken: 0,
             original_volume: None,
+            cry_tracker: CryTracker::new(),
         }
     }
 
@@ -316,6 +384,7 @@ impl DuckingEngine {
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, mutex::Mutex};
 
 /// Ducking tick task: consumes audio dB readings and drives the ducking engine.
+/// Also consumes cry detection results for baby cry notification.
 /// Runs independently of any WebSocket client — baby protection works even
 /// with the browser closed or WiFi momentarily down.
 #[embassy_executor::task]
@@ -327,12 +396,21 @@ pub async fn ducking_task(
     loop {
         let db = crate::DB_CHANNEL.receive().await;
 
-        // Tick the ducking engine
-        let (duck_cmd, armed, tripwire, ducking) = {
+        // Drain cry detection result (non-blocking, matches audio window rate)
+        let is_cry = crate::CRY_CHANNEL.try_receive().unwrap_or(false);
+
+        // Tick the ducking engine + cry tracker
+        let (duck_cmd, armed, tripwire, ducking, crying, cry_onset) = {
             let mut eng = engine.lock().await;
             let cmd = eng.tick(db);
             let ducking = eng.state() == DuckingState::Ducking;
-            (cmd, eng.armed, eng.tripwire_db, ducking)
+            let cry_onset = eng.cry_tracker.tick(is_cry);
+            let crying = eng.cry_tracker.crying;
+            if cry_onset {
+                dev_log!(crate::dev_log::LogCat::Audio, crate::dev_log::LogLevel::Info,
+                    "baby cry detected");
+            }
+            (cmd, eng.armed, eng.tripwire_db, ducking, crying, cry_onset)
         };
 
         // Update LED pattern ONLY when state changes (prevents led_step reset spam)
@@ -363,6 +441,12 @@ pub async fn ducking_task(
             t.armed = armed;
             t.tripwire = tripwire;
             t.ducking = ducking;
+            t.crying = crying;
+        }
+
+        // Send one-shot baby_cry event (ws.rs reads via channel)
+        if cry_onset {
+            let _ = crate::CRY_EVENT_CH.try_send(());
         }
 
         // Notify ws.rs that new telemetry is available (non-blocking)

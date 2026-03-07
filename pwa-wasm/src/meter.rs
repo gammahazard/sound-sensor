@@ -26,6 +26,7 @@ pub fn MeterScreen(
     armed:         ReadSignal<bool>,
     tripwire:      ReadSignal<f32>,
     ducking:       ReadSignal<bool>,
+    crying:        ReadSignal<bool>,
     events:        ReadSignal<Vec<EventEntry>>,
     on_arm_toggle: impl Fn() + 'static,
 ) -> impl IntoView {
@@ -66,6 +67,17 @@ pub fn MeterScreen(
                     <div style="font-weight:700;color:#fef3c7">"Volume Ducked"</div>
                     <div style="font-size:12px;color:#fde68a">
                         "Guardian detected sustained loud noise and reduced TV volume."
+                    </div>
+                </div>
+            })}
+
+            // ── Crying banner ──────────────────────────────────────────────
+            {move || crying.get().then(|| view! {
+                <div style="background:#991b1b;border-radius:16px;padding:14px;\
+                            text-align:center;animation:pulse 1.5s ease-in-out infinite">
+                    <div style="font-weight:700;font-size:16px;color:white">"Baby Crying Detected"</div>
+                    <div style="font-size:12px;color:#fecaca;margin-top:4px">
+                        "Rhythmic cry pattern confirmed."
                     </div>
                 </div>
             })}

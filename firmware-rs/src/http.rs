@@ -75,7 +75,7 @@ async fn handle_one_request(socket: &mut TcpSocket<'_>) -> bool {
     // "captive portal" and auto-opens the CNA sheet with our page inside it.
     if crate::AP_MODE.load(Ordering::Relaxed) {
         if method == "GET" {
-            serve_response(socket, "text/html; charset=utf-8", ServeBody::Bytes(crate::setup_html::SETUP_PAGE), false).await;
+            serve_response(socket, "text/html; charset=utf-8", ServeBody::Bytes(crate::setup_html::SETUP_PAGE), false, false).await;
         } else {
             send_error(socket, 404, "Not Found").await;
         }
@@ -94,44 +94,44 @@ async fn handle_one_request(socket: &mut TcpSocket<'_>) -> bool {
     match (method, path) {
         ("GET", "/" | "/index.html") => {
             if ota.index_html.1 > 0 {
-                serve_response(socket, "text/html; charset=utf-8", ServeBody::Flash(ota.index_html.0, ota.index_html.1), true).await;
+                serve_response(socket, "text/html; charset=utf-8", ServeBody::Flash(ota.index_html.0, ota.index_html.1), true, true).await;
             } else {
-                serve_response(socket, "text/html; charset=utf-8", ServeBody::Bytes(assets::INDEX_HTML), false).await;
+                serve_response(socket, "text/html; charset=utf-8", ServeBody::Bytes(assets::INDEX_HTML), false, true).await;
             }
         }
         ("GET", "/guardian-pwa.js") => {
             if ota.guardian_js.1 > 0 {
-                serve_response(socket, "application/javascript", ServeBody::Flash(ota.guardian_js.0, ota.guardian_js.1), true).await;
+                serve_response(socket, "application/javascript", ServeBody::Flash(ota.guardian_js.0, ota.guardian_js.1), true, true).await;
             } else {
-                serve_response(socket, "application/javascript", ServeBody::Bytes(assets::WASM_JS_GZ), true).await;
+                serve_response(socket, "application/javascript", ServeBody::Bytes(assets::WASM_JS_GZ), true, true).await;
             }
         }
         ("GET", "/guardian-pwa_bg.wasm") => {
             if ota.guardian_wasm.1 > 0 {
-                serve_response(socket, "application/wasm", ServeBody::Flash(ota.guardian_wasm.0, ota.guardian_wasm.1), true).await;
+                serve_response(socket, "application/wasm", ServeBody::Flash(ota.guardian_wasm.0, ota.guardian_wasm.1), true, true).await;
             } else {
-                serve_response(socket, "application/wasm", ServeBody::Bytes(assets::WASM_BG_GZ), true).await;
+                serve_response(socket, "application/wasm", ServeBody::Bytes(assets::WASM_BG_GZ), true, true).await;
             }
         }
         ("GET", "/sw.js") => {
             if ota.sw_js.1 > 0 {
-                serve_response(socket, "application/javascript", ServeBody::Flash(ota.sw_js.0, ota.sw_js.1), true).await;
+                serve_response(socket, "application/javascript", ServeBody::Flash(ota.sw_js.0, ota.sw_js.1), true, true).await;
             } else {
-                serve_response(socket, "application/javascript", ServeBody::Bytes(assets::SW_JS), false).await;
+                serve_response(socket, "application/javascript", ServeBody::Bytes(assets::SW_JS), false, true).await;
             }
         }
         ("GET", "/manifest.json") => {
             if ota.manifest_json.1 > 0 {
-                serve_response(socket, "application/manifest+json", ServeBody::Flash(ota.manifest_json.0, ota.manifest_json.1), true).await;
+                serve_response(socket, "application/manifest+json", ServeBody::Flash(ota.manifest_json.0, ota.manifest_json.1), true, true).await;
             } else {
-                serve_response(socket, "application/manifest+json", ServeBody::Bytes(assets::MANIFEST), false).await;
+                serve_response(socket, "application/manifest+json", ServeBody::Bytes(assets::MANIFEST), false, true).await;
             }
         }
         ("GET", "/icon-192.png") => {
-            serve_response(socket, "image/png", ServeBody::Bytes(assets::ICON_192), false).await;
+            serve_response(socket, "image/png", ServeBody::Bytes(assets::ICON_192), false, true).await;
         }
         ("GET", "/icon-512.png") => {
-            serve_response(socket, "image/png", ServeBody::Bytes(assets::ICON_512), false).await;
+            serve_response(socket, "image/png", ServeBody::Bytes(assets::ICON_512), false, true).await;
         }
         ("GET", "/version.json") => {
             let mut body: heapless::String<128> = heapless::String::new();
@@ -141,7 +141,7 @@ async fn handle_one_request(socket: &mut TcpSocket<'_>) -> bool {
                 crate::FW_VERSION,
                 crate::PWA_VERSION,
             );
-            serve_response(socket, "application/json", ServeBody::Bytes(body.as_bytes()), false).await;
+            serve_response(socket, "application/json", ServeBody::Bytes(body.as_bytes()), false, true).await;
         }
         ("POST", "/api/ota") => {
             handle_ota(socket).await;
@@ -162,7 +162,7 @@ enum ServeBody<'a> {
     Flash(u32, u32), // (offset, size)
 }
 
-async fn serve_response(socket: &mut TcpSocket<'_>, content_type: &str, body: ServeBody<'_>, gzip: bool) {
+async fn serve_response(socket: &mut TcpSocket<'_>, content_type: &str, body: ServeBody<'_>, gzip: bool, keep_alive: bool) {
     let content_len = match &body {
         ServeBody::Bytes(b) => b.len() as u32,
         ServeBody::Flash(_, size) => *size,
@@ -179,7 +179,11 @@ async fn serve_response(socket: &mut TcpSocket<'_>, content_type: &str, body: Se
     if gzip {
         let _ = headers.push_str("Content-Encoding: gzip\r\n");
     }
-    let _ = headers.push_str("Cache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n");
+    if keep_alive {
+        let _ = headers.push_str("Cache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n");
+    } else {
+        let _ = headers.push_str("Cache-Control: no-cache\r\nConnection: close\r\n\r\n");
+    }
 
     if socket.write_all(headers.as_bytes()).await.is_err() { return; }
 
@@ -230,7 +234,7 @@ async fn handle_ota(socket: &mut TcpSocket<'_>) {
         current.as_str(),
         false,
     );
-    serve_response(socket, "application/json", ServeBody::Bytes(json.as_bytes()), false).await;
+    serve_response(socket, "application/json", ServeBody::Bytes(json.as_bytes()), false, true).await;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

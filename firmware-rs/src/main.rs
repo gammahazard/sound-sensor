@@ -123,8 +123,9 @@ pub struct NetworkInfo {
     pub rssi: i16,
 }
 
-// ── Shared channel: audio_task → ducking_task ─────────────────────────────────
-pub static DB_CHANNEL: Channel<ThreadModeRawMutex, f32, 4> = Channel::new();
+// ── Shared channels: audio_task → ducking_task ────────────────────────────────
+pub static DB_CHANNEL:  Channel<ThreadModeRawMutex, f32, 4>  = Channel::new();
+pub static CRY_CHANNEL: Channel<ThreadModeRawMutex, bool, 4> = Channel::new();
 
 // ── Shared telemetry: ducking_task → websocket_task ──────────────────────────
 /// Latest dB + engine state, updated every 100ms by ducking_task.
@@ -134,12 +135,16 @@ pub struct TelemetrySnapshot {
     pub armed: bool,
     pub tripwire: f32,
     pub ducking: bool,
+    pub crying: bool,
 }
 pub static TELEMETRY: Mutex<ThreadModeRawMutex, TelemetrySnapshot> =
-    Mutex::new(TelemetrySnapshot { db: -60.0, armed: false, tripwire: -20.0, ducking: false });
+    Mutex::new(TelemetrySnapshot { db: -60.0, armed: false, tripwire: -20.0, ducking: false, crying: false });
 
 /// Signal channel: ducking_task notifies ws.rs that new telemetry is ready.
 pub static TELEM_SIGNAL: Channel<ThreadModeRawMutex, (), 1> = Channel::new();
+
+/// One-shot baby cry event: ducking_task → ws.rs (sends {"evt":"baby_cry"}).
+pub static CRY_EVENT_CH: Channel<ThreadModeRawMutex, (), 1> = Channel::new();
 
 // ── Inter-task channels ──────────────────────────────────────────────────────
 pub static LED_CHANNEL:  Channel<ThreadModeRawMutex, LedPattern, 4> = Channel::new();
