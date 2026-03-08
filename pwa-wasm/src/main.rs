@@ -292,6 +292,16 @@ fn App() -> impl IntoView {
                                 let cmd = if next { r#"{"cmd":"arm"}"# } else { r#"{"cmd":"disarm"}"# };
                                 send_sv.with_value(|f| f(cmd.to_string()));
                             }
+                            on_tripwire_change=move |v: f32| {
+                                set_tripwire.set(v);
+                                add_event_sv.with_value(|f| {
+                                    f(format!("Tripwire set: {:.0} dBFS", v))
+                                });
+                                send_sv.with_value(|f| f(
+                                    format!(r#"{{"cmd":"threshold","threshold":{:.1}}}"#, v)
+                                ));
+                                local_set("cal_tripwire", &v.to_string());
+                            }
                         />
                     }.into_any(),
 
@@ -305,16 +315,6 @@ fn App() -> impl IntoView {
                                 });
                                 send_sv.with_value(|f| f(
                                     format!(r#"{{"cmd":"calibrate_silence","db":{:.2}}}"#, db_val)
-                                ));
-                            }
-                            on_max=move |db_val: f32| {
-                                let tw = db_val - 3.0;
-                                set_tripwire.set(tw);
-                                add_event_sv.with_value(|f| {
-                                    f(format!("Calibrated — tripwire {:.1} dBFS", tw))
-                                });
-                                send_sv.with_value(|f| f(
-                                    format!(r#"{{"cmd":"calibrate_max","db":{:.2}}}"#, db_val)
                                 ));
                             }
                             on_threshold=move |v: f32| {

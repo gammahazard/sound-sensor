@@ -79,12 +79,9 @@ pub fn SetupWizard(
                             <div style="background:#1e293b;border-radius:16px;padding:16px;\
                                         display:flex;flex-direction:column;gap:12px">
                                 <div style="font-size:14px;color:#94a3b8;line-height:1.5">
-                                    "Place the sensor where the child usually is (not next to the TV). "
-                                    "Then use the Calibrate tab to:"
-                                </div>
-                                <div style="font-size:14px;color:#f1f5f9;line-height:1.6">
-                                    <strong>"Step 1:"</strong>" Record silence (TV off, quiet room)"
-                                    <br/><strong>"Step 2:"</strong>" Record TV at your preferred max volume"
+                                    "Record the quiet level in your baby's room. "
+                                    "You can fine-tune the threshold later by dragging "
+                                    "the white line on the meter."
                                 </div>
                             </div>
                             <button

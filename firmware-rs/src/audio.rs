@@ -293,6 +293,8 @@ fn evaluate_cry(
     zc_count: u32,
     total_energy: f32,
 ) -> bool {
+    const F0_FREQS: [u16; 5] = [350, 400, 450, 500, 550];
+
     // 1. Find strongest F0 bin + accumulate sum for peakedness check
     let mut best_idx = 0usize;
     let mut best_power = f0_powers[0];
@@ -304,24 +306,49 @@ fn evaluate_cry(
             best_idx = i;
         }
     }
-    if best_power < CRY_NOISE_FLOOR { return false; }
+    if best_power < CRY_NOISE_FLOOR {
+        // Too quiet for any tonal detection — skip logging (would spam)
+        return false;
+    }
+
+    // Pre-compute all metrics for logging
+    let harm_ratio = if best_power > 0.0 { harm_powers[best_idx] / best_power } else { 0.0 };
+    let avg_f0 = f0_sum / NUM_F0_BINS as f32;
+    let peakedness = if avg_f0 > 0.0 { best_power / avg_f0 } else { 0.0 };
+    let tonal = best_power + harm_powers[best_idx];
+    let tonal_ratio = if total_energy > 0.0 { tonal / total_energy } else { 0.0 };
 
     // 2. Adaptive harmonic at 2× the strongest F0
-    if harm_powers[best_idx] < best_power * HARMONIC_MIN_RATIO { return false; }
+    if harm_ratio < HARMONIC_MIN_RATIO {
+        dev_log!(crate::dev_log::LogCat::Audio, crate::dev_log::LogLevel::Info,
+            "cry fail: harmonic {:.3}<{:.3} f0={}Hz zc={}", harm_ratio, HARMONIC_MIN_RATIO, F0_FREQS[best_idx], zc_count);
+        return false;
+    }
 
     // 3. ZCR band check (350–550 Hz → 70–110 crossings per 100ms window)
-    if zc_count < ZCR_MIN || zc_count > ZCR_MAX { return false; }
+    if zc_count < ZCR_MIN || zc_count > ZCR_MAX {
+        dev_log!(crate::dev_log::LogCat::Audio, crate::dev_log::LogLevel::Info,
+            "cry fail: zcr={} [{}–{}] f0={}Hz pk={:.1}", zc_count, ZCR_MIN, ZCR_MAX, F0_FREQS[best_idx], peakedness);
+        return false;
+    }
 
     // 4. Harmonic-to-total energy ratio
-    if total_energy > 0.0 {
-        let tonal = best_power + harm_powers[best_idx];
-        if tonal / total_energy < TONAL_ENERGY_RATIO { return false; }
+    if total_energy > 0.0 && tonal_ratio < TONAL_ENERGY_RATIO {
+        dev_log!(crate::dev_log::LogCat::Audio, crate::dev_log::LogLevel::Info,
+            "cry fail: tonal {:.5}<{:.3} f0={}Hz", tonal_ratio, TONAL_ENERGY_RATIO, F0_FREQS[best_idx]);
+        return false;
     }
 
     // 5. Spectral peakedness: best F0 bin vs average of all F0 bins
-    let avg_f0 = f0_sum / NUM_F0_BINS as f32;
-    if avg_f0 > 0.0 && best_power / avg_f0 < PEAKEDNESS_MIN { return false; }
+    if avg_f0 > 0.0 && peakedness < PEAKEDNESS_MIN {
+        dev_log!(crate::dev_log::LogCat::Audio, crate::dev_log::LogLevel::Info,
+            "cry fail: peaked {:.2}<{:.1} f0={}Hz", peakedness, PEAKEDNESS_MIN, F0_FREQS[best_idx]);
+        return false;
+    }
 
+    dev_log!(crate::dev_log::LogCat::Audio, crate::dev_log::LogLevel::Info,
+        "cry PASS: f0={}Hz zc={} harm={:.3} tonal={:.4} pk={:.2}",
+        F0_FREQS[best_idx], zc_count, harm_ratio, tonal_ratio, peakedness);
     true
 }
 

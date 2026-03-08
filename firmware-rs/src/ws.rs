@@ -305,10 +305,11 @@ async fn apply_command(
         let (floor, tripwire) = {
             let mut eng = engine.lock().await;
             eng.set_floor(db);
+            eng.set_tripwire(db + 6.0);
             (eng.floor_db, eng.tripwire_db)
         };
         let _ = WIFI_CMD_CH.try_send(WifiCmd::SaveCalibration { floor, tripwire });
-        info!("[ws] Floor set to {} dBFS", db);
+        info!("[ws] Floor set to {} dBFS, tripwire auto-set to {}", db, tripwire);
 
     } else if cmd == Some("calibrate_max") {
         let db = parse_f32_field(s, r#""db":"#).unwrap_or(last_db);

@@ -1,6 +1,9 @@
 //! meter.rs — Real-time dB bar meter screen (Leptos)
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use leptos::prelude::*;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use crate::EventEntry;
 
@@ -10,6 +13,10 @@ const DB_MAX: f32 = -10.0;
 fn db_to_pct(db: f32) -> f32 {
     if !db.is_finite() { return 0.0; }
     ((db - DB_MIN) / (DB_MAX - DB_MIN) * 100.0).clamp(0.0, 100.0)
+}
+
+fn pct_to_db(pct: f32) -> f32 {
+    pct / 100.0 * (DB_MAX - DB_MIN) + DB_MIN
 }
 
 fn bar_color(db: f32) -> &'static str {
@@ -22,15 +29,17 @@ fn bar_color(db: f32) -> &'static str {
 
 #[component]
 pub fn MeterScreen(
-    db:            ReadSignal<f32>,
-    armed:         ReadSignal<bool>,
-    tripwire:      ReadSignal<f32>,
-    ducking:       ReadSignal<bool>,
-    crying:        ReadSignal<bool>,
-    events:        ReadSignal<Vec<EventEntry>>,
-    on_arm_toggle: impl Fn() + 'static,
+    db:                  ReadSignal<f32>,
+    armed:               ReadSignal<bool>,
+    tripwire:            ReadSignal<f32>,
+    ducking:             ReadSignal<bool>,
+    crying:              ReadSignal<bool>,
+    events:              ReadSignal<Vec<EventEntry>>,
+    on_arm_toggle:       impl Fn() + 'static,
+    on_tripwire_change:  impl Fn(f32) + 'static,
 ) -> impl IntoView {
     let on_arm_toggle = StoredValue::new_local(on_arm_toggle);
+    let on_tripwire_change = StoredValue::new_local(on_tripwire_change);
 
     // Peak hold (2 seconds)
     let (peak, set_peak)            = signal(DB_MIN);
@@ -56,6 +65,108 @@ pub fn MeterScreen(
             *peak_timer.write_value() = Some(id);
         }
     });
+
+    // Draggable tripwire state
+    let bar_ref = NodeRef::<leptos::html::Div>::new();
+    let (drag_db, set_drag_db) = signal(None::<f32>);
+
+    // Compute tripwire display: use drag_db while dragging, otherwise tripwire signal
+    let tripwire_display = move || drag_db.get().unwrap_or_else(|| tripwire.get());
+
+    // Shared Rc storage for window-level closures (so we can remove them on mouseup/touchend)
+    type ClosurePair<E> = Rc<RefCell<Option<(Closure<dyn FnMut(E)>, Closure<dyn FnMut(E)>)>>>;
+    let mouse_closures: ClosurePair<web_sys::MouseEvent> = Rc::new(RefCell::new(None));
+    let touch_closures: ClosurePair<web_sys::TouchEvent> = Rc::new(RefCell::new(None));
+
+    // Helper: compute dB from a client-X coordinate relative to the bar
+    let calc_db_from_x = move |client_x: f64| -> f32 {
+        let Some(el) = bar_ref.get() else { return tripwire.get_untracked(); };
+        let el: &web_sys::HtmlElement = &el;
+        let rect = el.get_bounding_client_rect();
+        let pct = ((client_x - rect.left()) / rect.width() * 100.0) as f32;
+        pct_to_db(pct.clamp(0.0, 100.0))
+    };
+
+    // Mouse drag start
+    let mc = mouse_closures.clone();
+    let on_mousedown = move |e: web_sys::MouseEvent| {
+        e.prevent_default();
+        let db_val = calc_db_from_x(e.client_x() as f64);
+        set_drag_db.set(Some(db_val));
+
+        let mc_inner = mc.clone();
+        let on_move = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
+            let db_val = calc_db_from_x(e.client_x() as f64);
+            set_drag_db.set(Some(db_val));
+        });
+
+        let mc_cleanup = mc_inner.clone();
+        let on_up = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
+            let final_db = calc_db_from_x(e.client_x() as f64);
+            set_drag_db.set(None);
+            on_tripwire_change.with_value(|f| f(final_db));
+            // Cleanup
+            if let Some(window) = web_sys::window() {
+                if let Some((ref m, ref u)) = *mc_cleanup.borrow() {
+                    let _ = window.remove_event_listener_with_callback("mousemove", m.as_ref().unchecked_ref());
+                    let _ = window.remove_event_listener_with_callback("mouseup", u.as_ref().unchecked_ref());
+                }
+            }
+            *mc_cleanup.borrow_mut() = None;
+        });
+
+        if let Some(window) = web_sys::window() {
+            let _ = window.add_event_listener_with_callback("mousemove", on_move.as_ref().unchecked_ref());
+            let _ = window.add_event_listener_with_callback("mouseup", on_up.as_ref().unchecked_ref());
+        }
+
+        *mc_inner.borrow_mut() = Some((on_move, on_up));
+    };
+
+    // Touch drag start
+    let tc = touch_closures.clone();
+    let on_touchstart = move |e: web_sys::TouchEvent| {
+        e.prevent_default();
+        if let Some(touch) = e.touches().get(0) {
+            let db_val = calc_db_from_x(touch.client_x() as f64);
+            set_drag_db.set(Some(db_val));
+        }
+
+        let tc_inner = tc.clone();
+        let on_move = Closure::<dyn FnMut(web_sys::TouchEvent)>::new(move |e: web_sys::TouchEvent| {
+            e.prevent_default();
+            if let Some(touch) = e.touches().get(0) {
+                let db_val = calc_db_from_x(touch.client_x() as f64);
+                set_drag_db.set(Some(db_val));
+            }
+        });
+
+        let tc_cleanup = tc_inner.clone();
+        let on_end = Closure::<dyn FnMut(web_sys::TouchEvent)>::new(move |e: web_sys::TouchEvent| {
+            if let Some(touch) = e.changed_touches().get(0) {
+                let final_db = calc_db_from_x(touch.client_x() as f64);
+                set_drag_db.set(None);
+                on_tripwire_change.with_value(|f| f(final_db));
+            } else {
+                set_drag_db.set(None);
+            }
+            // Cleanup
+            if let Some(window) = web_sys::window() {
+                if let Some((ref m, ref u)) = *tc_cleanup.borrow() {
+                    let _ = window.remove_event_listener_with_callback("touchmove", m.as_ref().unchecked_ref());
+                    let _ = window.remove_event_listener_with_callback("touchend", u.as_ref().unchecked_ref());
+                }
+            }
+            *tc_cleanup.borrow_mut() = None;
+        });
+
+        if let Some(window) = web_sys::window() {
+            let _ = window.add_event_listener_with_callback("touchmove", on_move.as_ref().unchecked_ref());
+            let _ = window.add_event_listener_with_callback("touchend", on_end.as_ref().unchecked_ref());
+        }
+
+        *tc_inner.borrow_mut() = Some((on_move, on_end));
+    };
 
     view! {
         <div style="padding:16px;display:flex;flex-direction:column;gap:16px">
@@ -97,20 +208,40 @@ pub fn MeterScreen(
             </div>
 
             // ── Bar meter ───────────────────────────────────────────────────
-            <div style="position:relative;height:40px;background:#1e293b;\
-                        border-radius:999px;overflow:hidden;margin:0 8px">
-                <div style=move || format!(
-                    "height:100%;border-radius:999px;\
-                     background:linear-gradient(to right,#22c55e 0%,#eab308 65%,#ef4444 85%);\
-                     width:{}%;transition:width 80ms linear",
-                    db_to_pct(db.get())
-                ) />
-                // Tripwire marker
-                <div style=move || format!(
-                    "position:absolute;top:0;bottom:0;width:2px;\
-                     background:white;opacity:0.7;left:{}%",
-                    db_to_pct(tripwire.get())
-                ) />
+            <div
+                node_ref=bar_ref
+                style="position:relative;height:40px;background:#1e293b;\
+                       border-radius:999px;overflow:visible;margin:0 8px"
+            >
+                // Filled bar (inside rounded container)
+                <div style="position:absolute;inset:0;border-radius:999px;overflow:hidden">
+                    <div style=move || format!(
+                        "height:100%;\
+                         background:linear-gradient(to right,#22c55e 0%,#eab308 65%,#ef4444 85%);\
+                         width:{}%;transition:width 80ms linear",
+                        db_to_pct(db.get())
+                    ) />
+                </div>
+                // Tripwire marker — draggable (24px invisible hit area, 2px visible line)
+                <div
+                    on:mousedown=on_mousedown
+                    on:touchstart=on_touchstart
+                    style=move || format!(
+                        "position:absolute;top:-4px;bottom:-4px;width:24px;\
+                         cursor:ew-resize;z-index:10;\
+                         left:calc({}% - 12px);\
+                         touch-action:none",
+                        db_to_pct(tripwire_display())
+                    )
+                >
+                    // Visible 2px line
+                    <div style="position:absolute;left:11px;top:4px;bottom:4px;\
+                                width:2px;background:white;opacity:0.85;border-radius:1px" />
+                    // Small handle dot for visual affordance
+                    <div style="position:absolute;left:8px;top:50%;transform:translateY(-50%);\
+                                width:8px;height:8px;border-radius:50%;\
+                                background:white;opacity:0.9" />
+                </div>
             </div>
 
             // Scale labels
@@ -140,7 +271,7 @@ pub fn MeterScreen(
                 </StatusCell>
                 <StatusCell label="Tripwire">
                     <span style="font-weight:600;font-variant-numeric:tabular-nums">
-                        {move || format!("{:.1}", tripwire.get())}
+                        {move || format!("{:.1}", tripwire_display())}
                     </span>
                 </StatusCell>
                 <StatusCell label="Peak">
@@ -226,6 +357,30 @@ mod tests {
     }
 
     #[test]
+    fn pct_to_db_min() {
+        assert_eq!(pct_to_db(0.0), -50.0);
+    }
+
+    #[test]
+    fn pct_to_db_max() {
+        assert_eq!(pct_to_db(100.0), -10.0);
+    }
+
+    #[test]
+    fn pct_to_db_mid() {
+        assert_eq!(pct_to_db(50.0), -30.0);
+    }
+
+    #[test]
+    fn pct_db_roundtrip() {
+        for db in [-50.0, -40.0, -30.0, -20.0, -10.0] {
+            let pct = db_to_pct(db);
+            let back = pct_to_db(pct);
+            assert!((back - db).abs() < 0.01, "roundtrip failed for {}", db);
+        }
+    }
+
+    #[test]
     fn bar_color_green() {
         assert_eq!(bar_color(-35.0), "#22c55e");
     }
@@ -242,13 +397,11 @@ mod tests {
 
     #[test]
     fn bar_color_boundary_yellow() {
-        // Exactly -30 should be green (not > -30)
         assert_eq!(bar_color(-30.0), "#22c55e");
     }
 
     #[test]
     fn bar_color_boundary_red() {
-        // Exactly -18 should be yellow (not > -18)
         assert_eq!(bar_color(-18.0), "#eab308");
     }
 }
