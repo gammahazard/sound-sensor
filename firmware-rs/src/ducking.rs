@@ -443,6 +443,8 @@ pub async fn ducking_task(
             t.ducking = ducking;
             t.crying = crying;
         }
+        // Update atomic tripwire for audio_task (lock-free read)
+        crate::set_tripwire_db(tripwire);
 
         // Send one-shot baby_cry event (ws.rs reads via channel)
         if cry_onset {

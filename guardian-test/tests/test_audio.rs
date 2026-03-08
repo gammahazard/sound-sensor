@@ -226,48 +226,42 @@ fn cry_powers(dominant_idx: usize, f0_power: f32, harm_ratio: f32) -> ([f32; 5],
 #[test]
 fn cry_like_v2_true_for_cry_at_450() {
     let (f0, harm) = cry_powers(2, 1e8, 0.10); // 450 Hz dominant, 10% harmonic
-    assert!(is_cry_like(&f0, &harm, 90, 1e10, -15.0, -20.0));
+    assert!(is_cry_like(&f0, &harm, 90, 1e10));
 }
 
 #[test]
 fn cry_like_v2_true_for_cry_at_500() {
     // Older baby — F0 at 500 Hz (bin index 3)
     let (f0, harm) = cry_powers(3, 1e8, 0.10);
-    assert!(is_cry_like(&f0, &harm, 100, 1e10, -15.0, -20.0));
+    assert!(is_cry_like(&f0, &harm, 100, 1e10));
 }
 
 #[test]
 fn cry_like_v2_true_for_cry_at_350() {
     // Newborn — F0 at 350 Hz (bin index 0)
     let (f0, harm) = cry_powers(0, 1e8, 0.10);
-    assert!(is_cry_like(&f0, &harm, 70, 1e10, -15.0, -20.0));
-}
-
-#[test]
-fn cry_like_v2_false_below_tripwire() {
-    let (f0, harm) = cry_powers(2, 1e8, 0.10);
-    assert!(!is_cry_like(&f0, &harm, 90, 1e10, -25.0, -20.0));
+    assert!(is_cry_like(&f0, &harm, 70, 1e10));
 }
 
 #[test]
 fn cry_like_v2_false_no_harmonic() {
     let (f0, mut harm) = cry_powers(2, 1e8, 0.10);
     harm[2] = 100.0; // kill the harmonic
-    assert!(!is_cry_like(&f0, &harm, 90, 1e10, -15.0, -20.0));
+    assert!(!is_cry_like(&f0, &harm, 90, 1e10));
 }
 
 #[test]
 fn cry_like_v2_false_zcr_too_low() {
     // ZCR too low — sub-200 Hz range, adult speech
     let (f0, harm) = cry_powers(2, 1e8, 0.10);
-    assert!(!is_cry_like(&f0, &harm, 30, 1e10, -15.0, -20.0));
+    assert!(!is_cry_like(&f0, &harm, 30, 1e10));
 }
 
 #[test]
 fn cry_like_v2_false_zcr_too_high() {
     // ZCR too high (broadband noise / very high freq)
     let (f0, harm) = cry_powers(2, 1e8, 0.10);
-    assert!(!is_cry_like(&f0, &harm, 200, 1e10, -15.0, -20.0));
+    assert!(!is_cry_like(&f0, &harm, 200, 1e10));
 }
 
 #[test]
@@ -276,21 +270,21 @@ fn cry_like_v2_false_flat_spectrum() {
     let f0 = [1e8; NUM_F0_BINS];
     let harm = [1e7; NUM_F0_BINS];
     // peakedness = 1.0 (equal) < 1.8 threshold → rejected
-    assert!(!is_cry_like(&f0, &harm, 90, 1e10, -15.0, -20.0));
+    assert!(!is_cry_like(&f0, &harm, 90, 1e10));
 }
 
 #[test]
 fn cry_like_v2_false_silence() {
     let f0 = [100.0; NUM_F0_BINS];
     let harm = [50.0; NUM_F0_BINS];
-    assert!(!is_cry_like(&f0, &harm, 0, 1e3, -15.0, -20.0));
+    assert!(!is_cry_like(&f0, &harm, 0, 1e3));
 }
 
 #[test]
 fn cry_like_v2_false_low_tonal_ratio() {
     // Tonal bins have some energy but total energy is vastly higher (broadband)
     let (f0, harm) = cry_powers(2, 1e6, 0.10);
-    assert!(!is_cry_like(&f0, &harm, 90, 1e15, -15.0, -20.0));
+    assert!(!is_cry_like(&f0, &harm, 90, 1e15));
 }
 
 // ── CryTracker temporal pattern tests ─────────────────────────────────────
@@ -399,7 +393,7 @@ fn full_pipeline_synthetic_cry_detected() {
     let db = compute_db(&samples);
 
     assert!(
-        is_cry_like(&f0_powers, &harm_powers, zc, energy_sum, db, -50.0),
+        is_cry_like(&f0_powers, &harm_powers, zc, energy_sum),
         "Synthetic 450+900 Hz cry should be detected: db={:.1}, zc={}, \
          f0_max={:.2e}, harm_at_best={:.2e}, energy={:.2e}",
         db, zc, f0_powers[2], harm_powers[2], energy_sum
@@ -451,10 +445,8 @@ fn full_pipeline_broadband_rejected() {
     ];
 
     let zc = count_zero_crossings(&samples);
-    let db = compute_db(&samples);
-
     assert!(
-        !is_cry_like(&f0_powers, &harm_powers, zc, energy_sum, db, -40.0),
+        !is_cry_like(&f0_powers, &harm_powers, zc, energy_sum),
         "Broadband noise should NOT be detected as cry"
     );
 }

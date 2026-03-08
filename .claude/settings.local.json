@@ -69,7 +69,12 @@
       "WebFetch(domain:courses.cs.washington.edu)",
       "WebFetch(domain:remcycles.net)",
       "WebFetch(domain:en.wikipedia.org)",
-      "WebFetch(domain:wirelesspi.com)"
+      "WebFetch(domain:wirelesspi.com)",
+      "Skill(code-review:code-review)",
+      "Bash(git diff:*)"
     ]
+  },
+  "enabledPlugins": {
+    "code-review@claude-plugins-official": true
   }
 }

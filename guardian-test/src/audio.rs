@@ -31,6 +31,14 @@ pub const WINDOW_N: usize = 1_600;
 /// Number of F0 bins covering the baby cry fundamental range (350–550 Hz).
 pub const NUM_F0_BINS: usize = 5;
 
+// ── Cry detection thresholds (must match firmware-rs/src/audio.rs) ───────
+const CRY_NOISE_FLOOR:    f32 = 1e6;
+const HARMONIC_MIN_RATIO: f32 = 0.05;
+const ZCR_MIN:            u32 = 50;
+const ZCR_MAX:            u32 = 130;
+const TONAL_ENERGY_RATIO: f32 = 0.005;
+const PEAKEDNESS_MIN:     f32 = 1.8;
+
 pub struct GoertzelBin {
     coeff: f32, // 2 * cos(2π * k / N), pre-computed
     s1: f32,    // v[n-1]
@@ -92,26 +100,18 @@ pub fn hanning(i: usize, n: usize) -> f32 {
 
 /// Evaluate whether the current 100ms window looks like a baby cry.
 ///
-/// Uses 6 checks:
-/// 1. Loud enough (db >= tripwire)
-/// 2. Strong F0 energy in cry band (best F0 bin > noise floor)
-/// 3. Harmonic present at 2× the strongest F0 (≥5% of fundamental)
-/// 4. ZCR consistent with 350–550 Hz tonal source (50–130 crossings per 100ms window)
-/// 5. Tonal energy ratio: cry concentrates energy at F0+harmonic vs total
-/// 6. Spectral peakedness: one F0 bin dominates (cry) vs flat (broadband)
+/// Uses 5 checks (volume-independent — runs regardless of tripwire):
+/// 1. Strong F0 energy in cry band (best F0 bin > noise floor)
+/// 2. Harmonic present at 2× the strongest F0 (≥5% of fundamental)
+/// 3. ZCR consistent with 350–550 Hz tonal source (50–130 crossings per 100ms window)
+/// 4. Tonal energy ratio: cry concentrates energy at F0+harmonic vs total
+/// 5. Spectral peakedness: one F0 bin dominates (cry) vs flat (broadband)
 pub fn is_cry_like(
     f0_powers: &[f32; NUM_F0_BINS],
     harm_powers: &[f32; NUM_F0_BINS],
     zc_count: u32,
     total_energy: f32,
-    db: f32,
-    tripwire: f32,
 ) -> bool {
-    // 1. Must be loud enough
-    if db < tripwire {
-        return false;
-    }
-
     // Find strongest F0 bin
     let mut best_idx = 0usize;
     let mut best_power = f0_powers[0];
@@ -123,18 +123,18 @@ pub fn is_cry_like(
     }
 
     // 2. Noise threshold: best F0 bin must have meaningful energy
-    if best_power < 1e6 {
+    if best_power < CRY_NOISE_FLOOR {
         return false;
     }
 
     // 3. Adaptive harmonic check: harmonic at 2× the strongest F0
-    if harm_powers[best_idx] < best_power * 0.05 {
+    if harm_powers[best_idx] < best_power * HARMONIC_MIN_RATIO {
         return false;
     }
 
     // 4. ZCR band check: baby cries at 350–550 Hz → 70–110 zero crossings
     // per 1600-sample (100ms) window. Allow wider margin (50–130) for harmonics.
-    if zc_count < 50 || zc_count > 130 {
+    if zc_count < ZCR_MIN || zc_count > ZCR_MAX {
         return false;
     }
 
@@ -142,16 +142,15 @@ pub fn is_cry_like(
     // at F0 + harmonic; broadband noise spreads it everywhere.
     if total_energy > 0.0 {
         let tonal = best_power + harm_powers[best_idx];
-        if tonal / total_energy < 0.005 {
+        if tonal / total_energy < TONAL_ENERGY_RATIO {
             return false;
         }
     }
 
     // 6. Spectral peakedness across F0 bins.
     // Baby cries peak at one F0; broadband noise spreads equally across bins.
-    // Ratio of best bin to average: cry > 2.0, broadband ≈ 1.0.
     let avg_f0 = f0_powers.iter().sum::<f32>() / NUM_F0_BINS as f32;
-    if avg_f0 > 0.0 && best_power / avg_f0 < 1.8 {
+    if avg_f0 > 0.0 && best_power / avg_f0 < PEAKEDNESS_MIN {
         return false;
     }
 

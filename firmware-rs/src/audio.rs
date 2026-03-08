@@ -26,6 +26,14 @@ const WINDOW_SAMPLES: usize = 1_600;   // 100 ms at 16 kHz
 const FULL_SCALE_24:  f32 = 8_388_608.0; // 2^23
 const NUM_F0_BINS:    usize = 5;
 
+// ── Cry detection thresholds ────────────────────────────────────────────
+const CRY_NOISE_FLOOR:    f32 = 1e6;   // min Goertzel power (~-78 dBFS single tone)
+const HARMONIC_MIN_RATIO: f32 = 0.05;  // harmonic must be ≥5% of fundamental
+const ZCR_MIN:            u32 = 50;    // min zero crossings per 100ms window
+const ZCR_MAX:            u32 = 130;   // max zero crossings per 100ms window
+const TONAL_ENERGY_RATIO: f32 = 0.005; // F0+harmonic must be ≥0.5% of total energy
+const PEAKEDNESS_MIN:     f32 = 1.8;   // best F0 bin / avg F0 bins ratio
+
 // ── Goertzel algorithm for tone detection ─────────────────────────────────
 // Computes DFT magnitude at specific frequencies without a full FFT.
 //
@@ -162,7 +170,6 @@ pub async fn audio_task(
     info!("[audio] Mic warmup complete");
 
     // ── Sample loop ───────────────────────────────────────────────────────
-    let mut buf  = [0f32; WINDOW_SAMPLES];
     let mut idx  = 0usize;
     let mut smoothed: f32 = -96.0;
     const EMA_ATTACK: f32 = 0.3;
@@ -186,15 +193,15 @@ pub async fn audio_task(
 
     // Hanning window via recursive cosine oscillator
     // w[n] = cos(2π·n/N), computed as w[n] = alpha·w[n-1] − w[n-2]
-    let hann_w2_init: f32 = libm::cosf(2.0 * core::f32::consts::PI * (WINDOW_SAMPLES - 1) as f32 / WINDOW_SAMPLES as f32);
+    const HANN_W2_INIT: f32 = 0.999992; // cos(2π·1599/1600), pre-computed
     let mut hann_w1: f32 = 1.0;  // cos(0) = 1
-    let mut hann_w2: f32 = hann_w2_init;
+    let mut hann_w2: f32 = HANN_W2_INIT;
 
     // Zero-crossing rate state
     let mut zc_count: u32 = 0;
     let mut prev_sign_positive: bool = false;
 
-    // Total energy accumulator (sum of filtered² for harmonic-to-total ratio)
+    // Energy accumulator (sum of filtered² — used for RMS dB AND harmonic-to-total ratio)
     let mut energy_sum: f32 = 0.0;
 
     loop {
@@ -211,10 +218,10 @@ pub async fn audio_task(
         hpf_y2 = hpf_y1;
         hpf_y1 = filtered;
 
-        buf[idx] = filtered;
+        // Accumulate total energy (always, for dB computation)
+        energy_sum += filtered * filtered;
 
         // Hanning window: h[n] = 0.5 − 0.5·cos(2π·n/N)
-        // Recursive cosine: w0 = alpha·w1 − w2
         let hann_w0 = HANN_ALPHA * hann_w1 - hann_w2;
         let hann_coeff = 0.5 - 0.5 * hann_w1;
         hann_w2 = hann_w1;
@@ -232,16 +239,13 @@ pub async fn audio_task(
         }
         prev_sign_positive = sign_pos;
 
-        // Accumulate total energy
-        energy_sum += filtered * filtered;
-
         idx += 1;
 
         if idx >= WINDOW_SAMPLES {
             idx = 0;
 
-            // ── dB computation ───────────────────────────────────────────
-            let db = compute_db(&buf);
+            // ── dB computation (from accumulated energy, no buffer needed) ──
+            let db = db_from_energy(energy_sum, WINDOW_SAMPLES);
             let alpha = if db > smoothed { EMA_ATTACK } else { EMA_DECAY };
             smoothed = alpha * db + (1.0 - alpha) * smoothed;
             if DB_CHANNEL.try_send(smoothed).is_err() {
@@ -249,10 +253,7 @@ pub async fn audio_task(
                     "DB_CHANNEL full, dropped db={:.1}", smoothed);
             }
 
-            // ── Cry detection (6-check pipeline) ─────────────────────────
-            let tripwire = crate::TELEMETRY.try_lock().map(|t| t.tripwire).unwrap_or(-20.0);
-
-            // Gather Goertzel bin powers
+            // ── Cry detection (5-check pipeline, volume-independent) ────
             let f0_powers = [
                 g_f0[0].power(), g_f0[1].power(), g_f0[2].power(),
                 g_f0[3].power(), g_f0[4].power(),
@@ -261,9 +262,8 @@ pub async fn audio_task(
                 g_harm[0].power(), g_harm[1].power(), g_harm[2].power(),
                 g_harm[3].power(), g_harm[4].power(),
             ];
-
             let cry_like = evaluate_cry(
-                &f0_powers, &harm_powers, zc_count, energy_sum, smoothed, tripwire,
+                &f0_powers, &harm_powers, zc_count, energy_sum,
             );
 
             if CRY_CHANNEL.try_send(cry_like).is_err() {
@@ -280,66 +280,56 @@ pub async fn audio_task(
 
             // Reset Hanning oscillator for next window
             hann_w1 = 1.0;
-            hann_w2 = hann_w2_init;
+            hann_w2 = HANN_W2_INIT;
         }
     }
 }
 
-/// Six-check cry detection pipeline.
+/// Five-check cry detection pipeline (volume-independent).
 /// Matches the logic in guardian-test/src/audio.rs::is_cry_like.
 fn evaluate_cry(
     f0_powers: &[f32; NUM_F0_BINS],
     harm_powers: &[f32; NUM_F0_BINS],
     zc_count: u32,
     total_energy: f32,
-    db: f32,
-    tripwire: f32,
 ) -> bool {
-    // 1. Loud enough
-    if db < tripwire { return false; }
-
-    // 2. Find strongest F0 bin + noise threshold
+    // 1. Find strongest F0 bin + accumulate sum for peakedness check
     let mut best_idx = 0usize;
     let mut best_power = f0_powers[0];
+    let mut f0_sum = f0_powers[0];
     for i in 1..NUM_F0_BINS {
+        f0_sum += f0_powers[i];
         if f0_powers[i] > best_power {
             best_power = f0_powers[i];
             best_idx = i;
         }
     }
-    if best_power < 1e6 { return false; }
+    if best_power < CRY_NOISE_FLOOR { return false; }
 
-    // 3. Adaptive harmonic at 2× the strongest F0
-    if harm_powers[best_idx] < best_power * 0.05 { return false; }
+    // 2. Adaptive harmonic at 2× the strongest F0
+    if harm_powers[best_idx] < best_power * HARMONIC_MIN_RATIO { return false; }
 
-    // 4. ZCR band check (350–550 Hz → 70–110 crossings per 100ms window)
-    if zc_count < 50 || zc_count > 130 { return false; }
+    // 3. ZCR band check (350–550 Hz → 70–110 crossings per 100ms window)
+    if zc_count < ZCR_MIN || zc_count > ZCR_MAX { return false; }
 
-    // 5. Harmonic-to-total energy ratio
+    // 4. Harmonic-to-total energy ratio
     if total_energy > 0.0 {
         let tonal = best_power + harm_powers[best_idx];
-        if tonal / total_energy < 0.005 { return false; }
+        if tonal / total_energy < TONAL_ENERGY_RATIO { return false; }
     }
 
-    // 6. Spectral peakedness: best F0 bin vs average of all F0 bins
-    let avg_f0 = f0_powers.iter().sum::<f32>() / NUM_F0_BINS as f32;
-    if avg_f0 > 0.0 && best_power / avg_f0 < 1.8 { return false; }
+    // 5. Spectral peakedness: best F0 bin vs average of all F0 bins
+    let avg_f0 = f0_sum / NUM_F0_BINS as f32;
+    if avg_f0 > 0.0 && best_power / avg_f0 < PEAKEDNESS_MIN { return false; }
 
     true
 }
 
-fn compute_db(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return -96.0;
-    }
-    let mut sum: f32 = 0.0;
-    for &s in samples {
-        sum += s * s;
-    }
-    let rms = libm::sqrtf(sum / samples.len() as f32);
-    if rms < 1.0 {
-        return -96.0;
-    }
+/// Compute dBFS from pre-accumulated energy sum (avoids storing full sample buffer).
+fn db_from_energy(energy_sum: f32, count: usize) -> f32 {
+    if count == 0 { return -96.0; }
+    let rms = libm::sqrtf(energy_sum / count as f32);
+    if rms < 1.0 { return -96.0; }
     let db = 20.0 * log10f(rms / FULL_SCALE_24);
     db.clamp(-96.0, 0.0)
 }

@@ -40,7 +40,7 @@ use embassy_rp::{
     peripherals::{PIO0, PIO1, USB, TRNG},
 };
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel, mutex::Mutex};
-use portable_atomic::{AtomicBool, AtomicU8};
+use portable_atomic::{AtomicBool, AtomicU8, AtomicU32};
 use static_cell::StaticCell;
 
 /// Structured dev log macro — forwards to WebSocket when `dev-mode` feature is on.
@@ -82,6 +82,19 @@ pub static AP_MODE: AtomicBool = AtomicBool::new(false);
 
 // ── TV connection status (0=off, 1=connecting, 2=connected, 3=error) ─────────
 pub static TV_STATUS: AtomicU8 = AtomicU8::new(0);
+
+// ── Atomic tripwire for audio_task (avoids mutex contention) ─────────────────
+static TRIPWIRE_BITS: AtomicU32 = AtomicU32::new(0xc1a0_0000); // f32::to_bits(-20.0)
+
+/// Read current tripwire dB (lock-free, used by audio_task).
+pub fn tripwire_db() -> f32 {
+    f32::from_bits(TRIPWIRE_BITS.load(portable_atomic::Ordering::Relaxed))
+}
+
+/// Update tripwire dB (called by ducking_task when engine tripwire changes).
+pub fn set_tripwire_db(db: f32) {
+    TRIPWIRE_BITS.store(db.to_bits(), portable_atomic::Ordering::Relaxed);
+}
 
 use ducking::DuckingEngine;
 use tv::TvConfig;

@@ -53,7 +53,7 @@ SPH0645LM4H ──I²S──►      │                                        
 
 The Pico 2 W runs seven concurrent Embassy tasks in normal (station) mode, or nine in AP setup mode:
 
-1. **audio_task** — Captures 24-bit I²S audio from the SPH0645 microphone at 16 kHz using a PIO state machine. Applies a 2nd-order Butterworth high-pass filter (200 Hz cutoff) per-sample. Every 100ms (1,600 samples) computes RMS dBFS with EMA smoothing and pushes to `DB_CHANNEL`. Also runs 10 Goertzel bins (5 F0 + 5 harmonic) with Hanning windowing, zero-crossing rate counting, and energy accumulation for baby cry spectral detection, pushing results to `CRY_CHANNEL`.
+1. **audio_task** — Captures 24-bit I²S audio from the SPH0645 microphone at 16 kHz using a PIO state machine. Applies a 2nd-order Butterworth high-pass filter (200 Hz cutoff) per-sample. Every 100ms (1,600 samples) computes RMS dBFS with EMA smoothing and pushes to `DB_CHANNEL`. Also runs 10 Goertzel bins (5 F0 + 5 harmonic) with Hanning windowing, zero-crossing rate counting, and energy accumulation for volume-independent baby cry spectral detection (5-check pipeline), pushing results to `CRY_CHANNEL`.
 
 2. **ducking_task** — Receives dB readings from `DB_CHANNEL` and cry detection results from `CRY_CHANNEL`. Ticks the ducking state machine and the `CryTracker` temporal pattern detector. Updates the shared `TELEMETRY` snapshot for the WebSocket task.
 
@@ -180,14 +180,15 @@ The audio pipeline runs 10 Goertzel bins inline with the existing sample loop �
 
 A **Hanning window** (via recursive cosine oscillator) reduces spectral leakage from -13 dB to -31 dB sidelobes, preventing nearby frequencies from bleeding into cry bins.
 
-Each 100ms window runs a 6-check pipeline:
+Each 100ms window runs a 5-check pipeline (volume-independent — no tripwire gate):
 
-1. **Volume gate**: dB ≥ tripwire (loud enough to matter)
-2. **F0 energy**: strongest cry bin > noise floor (meaningful tonal energy)
-3. **Adaptive harmonic**: harmonic at 2× the strongest F0 is ≥ 5% of fundamental (confirms tonal source, not broadband noise)
-4. **Zero-crossing rate**: 50–130 crossings per window (consistent with 350–550 Hz; rejects low-frequency rumble and high-frequency hiss)
-5. **Tonal energy ratio**: F0 + harmonic energy ≥ 0.5% of total energy (cry concentrates energy; broadband noise spreads it)
-6. **Spectral peakedness**: best F0 bin is ≥ 1.8× the average of all F0 bins (one dominant frequency, not flat spectrum)
+1. **F0 energy**: strongest cry bin > noise floor (meaningful tonal energy)
+2. **Adaptive harmonic**: harmonic at 2× the strongest F0 is ≥ 5% of fundamental (confirms tonal source, not broadband noise)
+3. **Zero-crossing rate**: 50–130 crossings per window (consistent with 350–550 Hz; rejects low-frequency rumble and high-frequency hiss)
+4. **Tonal energy ratio**: F0 + harmonic energy ≥ 0.5% of total energy (cry concentrates energy; broadband noise spreads it)
+5. **Spectral peakedness**: best F0 bin is ≥ 1.8× the average of all F0 bins (one dominant frequency, not flat spectrum)
+
+Cry detection is completely decoupled from the ducking tripwire — it runs on spectral characteristics alone, detecting crying at any volume level above the Goertzel noise floor.
 
 ### Temporal Pattern (CryTracker)
 
@@ -200,9 +201,9 @@ A single cry-positive window is not enough — a TV scene with a 450 Hz tone wou
 
 This means the fastest possible detection is ~3 seconds (3 short burst-gap cycles). A single 1-second TV cry scene will not trigger.
 
-### Always Active
+### Always Active, Volume-Independent
 
-Cry detection runs regardless of whether Guardian is armed or disarmed. The ducking system (TV volume control) only works when armed, but cry notification always works — parents always get alerted.
+Cry detection runs regardless of whether Guardian is armed or disarmed, and regardless of the current dB level relative to the ducking tripwire. It relies purely on spectral characteristics (Goertzel bin powers, harmonic ratios, ZCR, peakedness) rather than volume thresholds. This means a quiet cry across the house will still be detected if it has the right spectral signature. The ducking system (TV volume control) only works when armed, but cry notification always works — parents always get alerted.
 
 ### Resource Cost
 
@@ -366,7 +367,7 @@ The audio pipeline uses the RP2350's PIO (Programmable I/O) to implement an I²S
    dBFS = 20 * log10(rms / 8388608)    // 2^23 full-scale
    ```
 9. An **exponential moving average** (attack=0.3, decay=0.08) smooths the dB output
-10. **6-check cry detection pipeline** evaluates the Goertzel powers, ZCR, and energy
+10. **5-check cry detection pipeline** (volume-independent) evaluates the Goertzel powers, ZCR, and energy
 11. dB pushed to `DB_CHANNEL`, cry result pushed to `CRY_CHANNEL`
 12. If RMS < 1.0 (effectively silence), returns -96.0 dBFS
 
@@ -527,10 +528,10 @@ Bytes 252–255: CRC32 over bytes 0–251 (little-endian)
 ### Telemetry (server → client, 10x/sec)
 
 ```json
-{"db":-32.5,"armed":false,"tripwire":-20.0,"ducking":false,"crying":false,"fw":"0.3.0","pwa":"0.1.0"}
+{"db":-32.5,"armed":false,"tripwire":-20.0,"ducking":false,"crying":false,"tv_status":0,"fw":"0.3.0","pwa":"0.1.0"}
 ```
 
-All 7 fields are always present. `ducking` is true when the state machine is in the Ducking state. `crying` is true when the CryTracker has confirmed a rhythmic cry pattern (3+ burst-gap cycles).
+All 8 fields are always present. `ducking` is true when the state machine is in the Ducking state. `crying` is true when the CryTracker has confirmed a rhythmic cry pattern (3+ burst-gap cycles). `tv_status` is 0=off, 1=connecting, 2=connected, 3=error.
 
 ### Events (server → client, on demand)
 
@@ -675,14 +676,14 @@ PWA tests are `#[cfg(test)]` inline modules that compile natively (not to WASM).
 ### Running Tests
 
 ```bash
-# Firmware logic tests (186 tests, runs on host)
+# Firmware logic tests (185 tests, runs on host)
 cd guardian-test && cargo test
 
 # PWA logic tests (40 tests, runs on host)
 cd pwa-wasm && cargo test --lib --target x86_64-unknown-linux-gnu
 ```
 
-### Test Coverage: guardian-test (186 tests)
+### Test Coverage: guardian-test (185 tests)
 
 #### Ducking State Machine — 35 tests (`test_ducking.rs`)
 
@@ -736,7 +737,7 @@ Tests serialize/deserialize of the 256-byte config block: WiFi roundtrip, TV con
 
 Tests frame encoding for short payloads (< 126 bytes, 2-byte header), extended payloads (>= 126 bytes, 4-byte header), boundary cases (exactly 125 and 126 bytes), encode→decode roundtrips, too-short frame rejection, payload unmasking, and equivalence of `ws_text_frame` and `ws_frame_masked`.
 
-#### Audio + Cry Detection — 38 tests (`test_audio.rs`)
+#### Audio + Cry Detection — 37 tests (`test_audio.rs`)
 
 | Category | Count | What They Cover |
 |---|---|---|
@@ -745,7 +746,7 @@ Tests frame encoding for short payloads (< 126 bytes, 2-byte header), extended p
 | Hanning window | 3 | Endpoints near zero, center is 1.0, reduces spectral leakage 10× |
 | Multi-bin coverage | 2 | Catches 500 Hz cry (older baby), catches 350 Hz cry (newborn) |
 | Zero-crossing rate | 3 | 450 Hz → ~90 crossings, 200 Hz → ~40, silence → 0 |
-| is_cry_like v2 | 10 | True at 350/450/500 Hz, false for below tripwire, no harmonic, ZCR too low/high, flat spectrum, silence, low tonal ratio |
+| is_cry_like v2 | 9 | True at 350/450/500 Hz, false for no harmonic, ZCR too low/high, flat spectrum, silence, low tonal ratio |
 | CryTracker | 5 | 3 cycles confirms, 2 not enough, single burst rejected, cooldown clears, brief bursts rejected |
 | Integration | 2 | Full pipeline (synthetic 450+900 Hz → 10 Goertzel bins → is_cry_like = true), broadband noise rejected |
 
@@ -879,7 +880,7 @@ curl -X POST http://192.168.1.X:8060/keypress/VolumeUp
 - **Onboarding**: AP mode WiFi provisioning (Guardian-Setup hotspot → captive portal → credential entry → reboot)
 - **PWA**: Loads and renders correctly on desktop and mobile via direct IP access
 - **Sound detection**: I²S mic captures audio with 2nd-order Butterworth HPF for proper dynamic range
-- **Baby cry detection**: 10-bin Goertzel + Hanning window + ZCR + temporal pattern recognition, always active
+- **Baby cry detection**: 10-bin Goertzel + Hanning window + ZCR + temporal pattern recognition, always active, volume-independent (decoupled from ducking tripwire)
 - **Calibration**: Two-step calibration (silence + max) persists to flash
 - **Dev mode**: `--features dev-mode` enables Dev tab with log stream, state dashboard, WS inspector
 - **Gzip compression**: JS + WASM served compressed (~210 KB vs ~580 KB raw)
